@@ -4,17 +4,22 @@
 // Install:  go mod tidy && go build -o pixpack
 //
 // Encode:
-//   ./pixpack text "Hello world" -o hello.png
-//   ./pixpack url example.com -o link.png
-//   ./pixpack image photo.jpg -o p.png          # lossless, auto-split into multiple QRs if large
-//   ./pixpack image photo.jpg -fit -o p.png     # shrink + JPEG compress to fit 1 QR
-//   ./pixpack file data.bin -o d.png            # any binary, compressed (gzip/zstd/lzw/xz/brotli), auto-split
-//   ./pixpack file data.bin -o d.png            # default -fmt pixel: write directly into 16-bit RGBA PNG pixels (8 bytes/px)
-//   ./pixpack file data.bin -fmt grid|qr ...    # color grid / QR (scannable by phone)
+//
+//	./pixpack text "Hello world" -o hello.png
+//	./pixpack url example.com -o link.png
+//	./pixpack image photo.jpg -o p.png          # lossless, auto-split into multiple QRs if large
+//	./pixpack image photo.jpg -fit -o p.png     # shrink + JPEG compress to fit 1 QR
+//	./pixpack file data.bin -o d.png            # any binary, compressed (gzip/zstd/lzw/lzh/xz/brotli), auto-split
+//	./pixpack file data.bin -o d.png            # default -fmt pixel: write directly into 16-bit RGBA PNG pixels (8 bytes/px)
+//	./pixpack file data.bin -fmt grid|qr ...    # color grid / QR (scannable by phone)
+//
 // Decode (restore original file from QR images):
-//   ./pixpack decode -o out/ d_*.png
+//
+//	./pixpack decode -o out/ d_*.png
+//
 // Web server (port 8090):
-//   ./pixpack serve [-addr :8090]
+//
+//	./pixpack serve [-addr :8090]
 package main
 
 import (
@@ -39,6 +44,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -142,63 +148,51 @@ func b45dec(s string) ([]byte, error) {
 	return out, nil
 }
 
-// ---------- Packaging: [name][data] -> best algo -> base45 -> chunk ----------
+// ---------- Packaging ----------
 
-// pack = packWith without progress reporting.
 func pack(name string, data []byte) ([]byte, error) { return packWith(name, data, nil) }
 
-// precompressedExt are file extensions that are already compressed inside.
-// Running brotli/CMX1/xz on them wastes minutes for <10% savings.
 var precompressedExt = map[string]bool{
-	// Video/audio
 	".3gp": true, ".mp4": true, ".mkv": true, ".avi": true, ".mov": true,
 	".webm": true, ".flv": true, ".wmv": true, ".m4v": true, ".mpg": true,
 	".mp3": true, ".aac": true, ".ogg": true, ".flac": true, ".m4a": true,
 	".opus": true, ".wma": true, ".wav": true, ".aiff": true,
-	// Images (already compressed internally)
 	".jpg": true, ".jpeg": true, ".png": true, ".gif": true, ".webp": true,
 	".heic": true, ".heif": true, ".avif": true, ".bmp": true, ".tiff": true,
 	".tif": true, ".ico": true,
-	// Archives / packages
 	".zip": true, ".apk": true, ".jar": true, ".aar": true, ".war": true,
 	".rar": true, ".7z": true, ".gz": true, ".bz2": true, ".xz": true,
 	".zst": true, ".lz4": true, ".lzma": true, ".tgz": true, ".tbz2": true,
 	".txz": true, ".tar.gz": true, ".tar.bz2": true, ".tar.xz": true,
 	".cab": true, ".deb": true, ".rpm": true, ".dmg": true, ".iso": true,
 	".whl": true, ".egg": true,
-	// Documents (Office Open XML = ZIP container)
 	".pdf": true, ".docx": true, ".xlsx": true, ".pptx": true,
 	".odt": true, ".ods": true, ".odp": true, ".epub": true, ".mobi": true,
-	// Executables (compiled, may contain compressed sections)
 	".exe": true, ".dll": true, ".so": true, ".dylib": true, ".bin": true,
 	".class": true, ".dex": true, ".wasm": true,
 }
 
-// precompressedMagic detects container formats by their magic bytes,
-// even if the extension was renamed.
 var precompressedMagic = [][]byte{
-	{0x1F, 0x8B},             // gzip
-	{0x50, 0x4B, 0x03, 0x04}, // ZIP / APK / JAR / DOCX / EPUB
-	{0x50, 0x4B, 0x05, 0x06}, // ZIP empty
-	{0x50, 0x4B, 0x07, 0x08}, // ZIP split
-	{0x89, 0x50, 0x4E, 0x47}, // PNG
-	{0xFF, 0xD8, 0xFF},       // JPEG
-	{0x47, 0x49, 0x46, 0x38}, // GIF8
-	{0x66, 0x74, 0x79, 0x70}, // "ftyp" — MP4 / 3GP / MOV / M4A
-	{0x49, 0x44, 0x33},       // "ID3" — MP3
-	{0x4F, 0x67, 0x67, 0x53}, // "OggS" — OGG / OPUS
-	{0x66, 0x4C, 0x61, 0x43}, // "fLaC" — FLAC
-	{0x25, 0x50, 0x44, 0x46}, // "%PDF"
-	{0x52, 0x61, 0x72, 0x21}, // "Rar!"
-	{0x37, 0x7A, 0xBC, 0xAF}, // 7z
-	{0xFD, '7', 'z', 'X', 'Z'}, // xz
-	{0x28, 0xB5, 0x2F, 0xFD}, // zstd
-	{0x04, 0x22, 0x4D, 0x18}, // lz4
-	{0x1A, 0x45, 0xDF, 0xA3}, // matroska / webm
+	{0x1F, 0x8B},
+	{0x50, 0x4B, 0x03, 0x04},
+	{0x50, 0x4B, 0x05, 0x06},
+	{0x50, 0x4B, 0x07, 0x08},
+	{0x89, 0x50, 0x4E, 0x47},
+	{0xFF, 0xD8, 0xFF},
+	{0x47, 0x49, 0x46, 0x38},
+	{0x66, 0x74, 0x79, 0x70},
+	{0x49, 0x44, 0x33},
+	{0x4F, 0x67, 0x67, 0x53},
+	{0x66, 0x4C, 0x61, 0x43},
+	{0x25, 0x50, 0x44, 0x46},
+	{0x52, 0x61, 0x72, 0x21},
+	{0x37, 0x7A, 0xBC, 0xAF},
+	{0xFD, '7', 'z', 'X', 'Z'},
+	{0x28, 0xB5, 0x2F, 0xFD},
+	{0x04, 0x22, 0x4D, 0x18},
+	{0x1A, 0x45, 0xDF, 0xA3},
 }
 
-// looksPrecompressed returns true if the file is likely already compressed
-// (image/audio/video/archive/office doc) based on extension or magic bytes.
 func looksPrecompressed(name string, data []byte) bool {
 	ext := strings.ToLower(filepath.Ext(name))
 	if ext == ".gz" || ext == ".bz2" || ext == ".xz" || ext == ".zst" || ext == ".lz4" {
@@ -221,8 +215,6 @@ func looksPrecompressed(name string, data []byte) bool {
 	return false
 }
 
-// packWith concatenates [name][data] then tries multiple compression algorithms
-// in parallel and keeps the smallest.
 func packWith(name string, data []byte, report func(map[string]any)) ([]byte, error) {
 	emit := func(e map[string]any) {
 		if report != nil {
@@ -241,7 +233,11 @@ func packWith(name string, data []byte, report func(map[string]any)) ([]byte, er
 	big := len(raw) > 64<<20
 	noSlow := precompressed
 	huge := len(raw) > 8<<20
-	total := 7
+	isDNA := looksDNA(data)
+	total := 9
+	if isDNA {
+		total += 4 // dna2-pack, dna2-zstd, dna2-lzh, dna2-brotli
+	}
 	emit(map[string]any{"type": "packstart", "total": total, "orig": len(data), "precompressed": precompressed})
 
 	var mu sync.Mutex
@@ -276,6 +272,56 @@ func packWith(name string, data []byte, report func(map[string]any)) ([]byte, er
 		}()
 	}
 
+	// DNA mode: pack 2-bit first, then compress the wrapped output.
+	// Wrapped = [name_len][name][DNA2-packed-content]
+	if isDNA {
+		packed := packDNA2Bit(data)
+		wrapped := make([]byte, 0, 2+len(name)+len(packed))
+		wrapped = append(wrapped, byte(len(name)>>8), byte(len(name)))
+		wrapped = append(wrapped, name...)
+		wrapped = append(wrapped, packed...)
+
+		run("dna2-pack", func() []byte {
+			out := make([]byte, 0, 5+len(wrapped))
+			out = append(out, 'D', 'N', 'A', '3', 'p')
+			out = append(out, wrapped...)
+			return out
+		})
+		run("dna2-zstd", func() []byte {
+			enc, err := zstd.NewWriter(nil, zstd.WithEncoderLevel(zstd.SpeedBestCompression), zstd.WithEncoderConcurrency(1))
+			if err != nil {
+				return nil
+			}
+			defer enc.Close()
+			inner := enc.EncodeAll(wrapped, nil)
+			out := make([]byte, 0, 5+len(inner))
+			out = append(out, 'D', 'N', 'A', '3', 'z')
+			out = append(out, inner...)
+			return out
+		})
+		run("dna2-lzh", func() []byte {
+			inner := lzhCompress(wrapped)
+			if inner == nil {
+				return nil
+			}
+			out := make([]byte, 0, 5+len(inner))
+			out = append(out, 'D', 'N', 'A', '3', 'l')
+			out = append(out, inner...)
+			return out
+		})
+		run("dna2-brotli", func() []byte {
+			var buf bytes.Buffer
+			bw := brotli.NewWriterOptions(&buf, brotli.WriterOptions{Quality: 11, LGWin: 24})
+			if _, err := bw.Write(wrapped); err != nil || bw.Close() != nil {
+				return nil
+			}
+			out := make([]byte, 0, 5+buf.Len())
+			out = append(out, 'D', 'N', 'A', '3', 'b')
+			out = append(out, buf.Bytes()...)
+			return out
+		})
+	}
+
 	run("gzip", func() []byte {
 		var buf bytes.Buffer
 		zw, err := gzip.NewWriterLevel(&buf, gzip.BestCompression)
@@ -299,14 +345,28 @@ func packWith(name string, data []byte, report func(map[string]any)) ([]byte, er
 	if lzwLooksIncompressible(raw) {
 		emit(map[string]any{"type": "algo", "name": "lzw", "skipped": true, "reason": "incompressible"})
 		emit(map[string]any{"type": "algo", "name": "lzw-parallel", "skipped": true, "reason": "incompressible"})
+		emit(map[string]any{"type": "algo", "name": "lzh", "skipped": true, "reason": "incompressible"})
+		emit(map[string]any{"type": "algo", "name": "lzw-preset", "skipped": true, "reason": "incompressible"})
 	} else if len(raw) >= lzwParallelMinSize {
 		run("lzw-parallel", func() []byte {
 			return lzwCompressParallel(raw)
+		})
+		run("lzh", func() []byte {
+			return lzhCompress(raw)
+		})
+		run("lzw-preset", func() []byte {
+			return lzwCompressWithPreset(raw)
 		})
 		emit(map[string]any{"type": "algo", "name": "lzw", "skipped": true, "reason": "use_parallel"})
 	} else {
 		run("lzw", func() []byte {
 			return lzwCompress(raw)
+		})
+		run("lzh", func() []byte {
+			return lzhCompress(raw)
+		})
+		run("lzw-preset", func() []byte {
+			return lzwCompressWithPreset(raw)
 		})
 		emit(map[string]any{"type": "algo", "name": "lzw-parallel", "skipped": true, "reason": "use_single"})
 	}
@@ -365,12 +425,62 @@ func packWith(name string, data []byte, report func(map[string]any)) ([]byte, er
 	return best, nil
 }
 
-// unpack returns filename, data, and the name of the compression algorithm used.
 func unpack(comp []byte) (string, []byte, string, error) {
+	// DNA3 fast path: [name][compressed(DNA2-packed)]
+	if len(comp) >= 5 {
+		magic := string(comp[:5])
+		if magic == "DNA3p" || magic == "DNA3z" || magic == "DNA3l" || magic == "DNA3b" {
+			var inner []byte
+			var innerErr error
+			var innerAlgo string
+			switch magic {
+			case "DNA3p":
+				innerAlgo = "dna2-pack"
+				inner = comp[5:]
+			case "DNA3z":
+				innerAlgo = "dna2-zstd"
+				dec, e := zstd.NewReader(nil, zstd.WithDecoderConcurrency(1))
+				if e != nil {
+					return "", nil, innerAlgo, e
+				}
+				inner, innerErr = dec.DecodeAll(comp[5:], nil)
+				dec.Close()
+			case "DNA3l":
+				innerAlgo = "dna2-lzh"
+				inner, innerErr = lzhDecompress(comp[5:])
+			case "DNA3b":
+				innerAlgo = "dna2-brotli"
+				inner, innerErr = io.ReadAll(brotli.NewReader(bytes.NewReader(comp[5:])))
+			}
+			if innerErr != nil {
+				return "", nil, innerAlgo, fmt.Errorf("dna3 decompress: %w", innerErr)
+			}
+			if len(inner) < 2 {
+				return "", nil, innerAlgo, errors.New("dna3: inner too short")
+			}
+			n := int(binary.BigEndian.Uint16(inner[:2]))
+			if len(inner) < 2+n {
+				return "", nil, innerAlgo, errors.New("dna3: name corrupt")
+			}
+			nm := string(inner[2 : 2+n])
+			data, e := unpackDNA2Bit(inner[2+n:])
+			if e != nil {
+				return "", nil, innerAlgo, e
+			}
+			return nm, data, innerAlgo, nil
+		}
+	}
+
 	var raw []byte
 	var err error
 	algo := "gzip"
 	switch {
+	case bytes.HasPrefix(comp, []byte("LZH1")):
+		algo = "lzh"
+		raw, err = lzhDecompress(comp)
+	case bytes.HasPrefix(comp, []byte("LZW2")):
+		algo = "lzw-preset"
+		raw, err = lzwDecompressWithPreset(comp)
 	case bytes.HasPrefix(comp, []byte{0x28, 0xB5, 0x2F, 0xFD}):
 		algo = "zstd"
 		var dec *zstd.Decoder
@@ -437,7 +547,7 @@ func chunkStrings(name string, data []byte, o opts) ([]string, error) {
 	return out, nil
 }
 
-// ---------- Image shrink to fit one QR ----------
+// ---------- Image shrink ----------
 
 func resize(src image.Image, nw, nh int) *image.RGBA {
 	b := src.Bounds()
@@ -1276,6 +1386,7 @@ function skipLabel(r){
     case "use_parallel": return "skipped (using lzw-parallel instead)";
     case "use_single": return "skipped (using lzw instead)";
     case "precompressed": return "skipped (already compressed content)";
+    case "not_dna": return "skipped (not DNA)";
   }
   return "skipped";
 }
@@ -1286,7 +1397,7 @@ function render(d,rows,pack){
     h+="<div class=\"notice\" style=\"background:#fef3c7;border:1px solid #f59e0b;color:#78350f;padding:10px;border-radius:8px;margin-bottom:12px\">";
     h+="⚠️ <b>Already-compressed file detected</b> (video/audio/image/archive/office). ";
     h+="Slow algorithms (xz, brotli, CMX1) were skipped — they only save &lt;10% but cost minutes of CPU. ";
-    h+="Only fast algorithms (gzip, zstd, lzw) were tried.";
+    h+="Only fast algorithms (gzip, zstd, lzw, lzh) were tried.";
     h+="</div>";
   }
   h+="<h3>Result</h3><table>";
@@ -1414,7 +1525,7 @@ $("dgo").onclick=function(){
 </script></body></html>`
 
 // ======================================================================
-// Color grid format (grid)
+// Color grid format
 // ======================================================================
 
 const (
@@ -1630,7 +1741,7 @@ func tryGrid(img image.Image) (item, bool) {
 }
 
 // ======================================================================
-// Pixel format (densest)
+// Pixel format
 // ======================================================================
 
 const (
@@ -1806,10 +1917,6 @@ func tryPixel(img image.Image) (item, bool) {
 // ======================================================================
 // LZW v4
 // ======================================================================
-// Formats:
-//   "LZW1" + uvarint(len) + bitstream            ← regular (with run codes)
-//   "LZWS" + uvarint(len) + raw bytes            ← store mode
-//   "LZWP" + uvarint(total) + uvarint(n) + ...   ← parallel
 
 const (
 	lzwMaxCode   = 4096
@@ -2050,9 +2157,6 @@ func (a *lzwAdaptiveClear) reset() {
 	a.lastRatio = 0
 }
 
-// lzwLooksIncompressible samples 4 regions (start, 1/4, 1/2, 3/4) of 512 bytes
-// each. Container formats (.3gp, .mp4, .apk) have structured 1KB headers but
-// entropy-coded bulk — sampling multiple regions catches them.
 func lzwLooksIncompressible(data []byte) bool {
 	n := len(data)
 	if n == 0 {
@@ -2081,7 +2185,6 @@ func lzwLooksIncompressible(data []byte) bool {
 	return false
 }
 
-// lzwStoreMode wraps raw bytes in a store-mode container ("LZWS").
 func lzwStoreMode(raw []byte) []byte {
 	out := make([]byte, 0, 5+len(raw)+10)
 	out = append(out, 'L', 'Z', 'W', 'S')
@@ -2091,8 +2194,6 @@ func lzwStoreMode(raw []byte) []byte {
 	return out
 }
 
-// lzwShouldStore returns true if compressed output should be replaced by store
-// mode. Rule: compressed must save at least 5% AND be smaller than storeLen.
 func lzwShouldStore(rawLen int, compLen int) bool {
 	if compLen >= rawLen-rawLen/20 {
 		return true
@@ -2259,8 +2360,6 @@ func lzwCompressParallel(raw []byte) []byte {
 		out = append(out, r...)
 	}
 
-	// Whole-file store-mode fallback: if parallel output isn't clearly smaller
-	// than input, emit store mode instead of a bloated LZWP container.
 	if lzwShouldStore(len(raw), len(out)) {
 		return lzwStoreMode(raw)
 	}
@@ -2516,7 +2615,934 @@ func lzwDecompressParallel(comp []byte) ([]byte, error) {
 }
 
 // ======================================================================
-// CMX1 v2 - context mixing (lpaq-style)
+// LZH v1: LZW + Huffman
+// ======================================================================
+
+func lzwEncodeToCodes(raw []byte) []int32 {
+	if len(raw) == 0 {
+		return nil
+	}
+	codes := make([]int32, 0, len(raw))
+	var h lzwFastHash
+	nextCode := int32(lzwClearCode + 1)
+
+	w := int32(raw[0])
+	for i := 1; i < len(raw); i++ {
+		b := raw[i]
+		key := uint32(w)<<8 | uint32(b)
+		if code, ok := h.lookup(key); ok {
+			w = code
+			continue
+		}
+		codes = append(codes, w)
+		if nextCode < lzwMaxCode {
+			h.insert(key, nextCode)
+			nextCode++
+		}
+		w = int32(b)
+	}
+	codes = append(codes, w)
+	return codes
+}
+
+func lzwDecodeCodes(codes []int32) []byte {
+	if len(codes) == 0 {
+		return nil
+	}
+	var dictPrefix [lzwMaxCode]int32
+	var dictByte [lzwMaxCode]byte
+	var dictLen [lzwMaxCode]int32
+	for i := 0; i < 256; i++ {
+		dictPrefix[i] = -1
+		dictByte[i] = byte(i)
+		dictLen[i] = 1
+	}
+	for i := 256; i < lzwMaxCode; i++ {
+		dictPrefix[i] = -1
+	}
+
+	nextCode := int32(lzwClearCode + 1)
+	var out []byte
+	var stack [lzwMaxCode + 16]byte
+
+	first := codes[0]
+	if first >= 256 {
+		return nil
+	}
+	out = append(out, byte(first))
+	w := first
+
+	for i := 1; i < len(codes); i++ {
+		code := codes[i]
+
+		var entryLen int32
+		var entryCode int32
+		kwkwk := false
+		if code < nextCode {
+			entryLen = dictLen[code]
+			entryCode = code
+		} else if code == nextCode && w >= 0 {
+			entryLen = dictLen[w] + 1
+			entryCode = w
+			kwkwk = true
+		} else {
+			return nil
+		}
+
+		sp := int(entryLen)
+		if kwkwk {
+			sp = int(dictLen[w])
+		}
+		ec := entryCode
+		for ec >= 0 && sp > 0 {
+			sp--
+			stack[sp] = dictByte[ec]
+			ec = dictPrefix[ec]
+		}
+		firstByte := stack[0]
+
+		if kwkwk {
+			wLen := int(dictLen[w])
+			out = append(out, stack[0:wLen]...)
+			out = append(out, stack[0])
+		} else {
+			out = append(out, stack[0:entryLen]...)
+		}
+
+		if nextCode < lzwMaxCode {
+			dictPrefix[nextCode] = w
+			dictByte[nextCode] = firstByte
+			dictLen[nextCode] = dictLen[w] + 1
+			nextCode++
+		}
+		w = code
+		if kwkwk {
+			w = nextCode - 1
+		}
+	}
+	return out
+}
+
+func lzhCompress(raw []byte) []byte {
+	codes := lzwEncodeToCodes(raw)
+	if len(codes) == 0 {
+		return nil
+	}
+
+	freq := make(map[int32]int, 4096)
+	for _, c := range codes {
+		freq[c]++
+	}
+
+	type hn struct {
+		freq   int
+		code   int32
+		left   int32
+		right  int32
+		isLeaf bool
+	}
+	var tree []hn
+	var heap []int32
+
+	for code, f := range freq {
+		tree = append(tree, hn{freq: f, code: code, left: -1, right: -1, isLeaf: true})
+		heap = append(heap, int32(len(tree)-1))
+	}
+	sort.Slice(heap, func(i, j int) bool {
+		return tree[heap[i]].freq < tree[heap[j]].freq
+	})
+
+	for len(heap) > 1 {
+		a, b := heap[0], heap[1]
+		heap = heap[2:]
+		tree = append(tree, hn{
+			freq:  tree[a].freq + tree[b].freq,
+			left:  a,
+			right: b,
+			code:  -1,
+		})
+		ni := int32(len(tree) - 1)
+		lo, hi := 0, len(heap)
+		for lo < hi {
+			mid := (lo + hi) / 2
+			if tree[heap[mid]].freq < tree[ni].freq {
+				lo = mid + 1
+			} else {
+				hi = mid
+			}
+		}
+		heap = append(heap, 0)
+		copy(heap[lo+1:], heap[lo:])
+		heap[lo] = ni
+	}
+
+	root := heap[0]
+
+	type hc struct {
+		code int32
+		len  uint8
+	}
+	huffCodes := make(map[int32]hc, len(freq))
+	var walk func(idx int32, c int32, l uint8)
+	walk = func(idx int32, c int32, l uint8) {
+		n := &tree[idx]
+		if n.isLeaf {
+			if l == 0 {
+				l = 1
+			}
+			huffCodes[n.code] = hc{c, l}
+			return
+		}
+		walk(n.left, c<<1, l+1)
+		walk(n.right, (c<<1)|1, l+1)
+	}
+	walk(root, 0, 0)
+
+	var treeBuf bytes.Buffer
+	var tmp [binary.MaxVarintLen64]byte
+	treeBuf.Write(tmp[:binary.PutUvarint(tmp[:], uint64(len(tree)))])
+	for _, n := range tree {
+		if n.isLeaf {
+			treeBuf.WriteByte(1)
+			treeBuf.Write(tmp[:binary.PutUvarint(tmp[:], uint64(uint32(n.code)))])
+		} else {
+			treeBuf.WriteByte(0)
+			var b4 [4]byte
+			binary.LittleEndian.PutUint32(b4[:], uint32(n.left))
+			treeBuf.Write(b4[:])
+			binary.LittleEndian.PutUint32(b4[:], uint32(n.right))
+			treeBuf.Write(b4[:])
+		}
+	}
+
+	var out bytes.Buffer
+	out.WriteString("LZH1")
+	out.Write(tmp[:binary.PutUvarint(tmp[:], uint64(len(raw)))])
+	out.Write(tmp[:binary.PutUvarint(tmp[:], uint64(len(codes)))])
+	out.Write(tmp[:binary.PutUvarint(tmp[:], uint64(treeBuf.Len()))])
+	out.Write(treeBuf.Bytes())
+
+	var bitbuf uint64
+	var bitcnt uint
+	for _, c := range codes {
+		h := huffCodes[c]
+		bitbuf = (bitbuf << h.len) | uint64(h.code)
+		bitcnt += uint(h.len)
+		for bitcnt >= 8 {
+			bitcnt -= 8
+			out.WriteByte(byte(bitbuf >> bitcnt))
+			bitbuf &= (1 << bitcnt) - 1
+		}
+	}
+	if bitcnt > 0 {
+		out.WriteByte(byte(bitbuf << (8 - bitcnt)))
+	}
+	return out.Bytes()
+}
+
+func lzhDecompress(comp []byte) ([]byte, error) {
+	if !bytes.HasPrefix(comp, []byte("LZH1")) {
+		return nil, errors.New("not LZH1 data")
+	}
+	rest := comp[4:]
+
+	rawLen64, k := binary.Uvarint(rest)
+	if k <= 0 || rawLen64 > 1<<31 {
+		return nil, errors.New("LZH1: bad rawLen")
+	}
+	rawLen := int(rawLen64)
+	rest = rest[k:]
+
+	numCodes64, k := binary.Uvarint(rest)
+	if k <= 0 || numCodes64 > 1<<30 {
+		return nil, errors.New("LZH1: bad numCodes")
+	}
+	numCodes := int(numCodes64)
+	rest = rest[k:]
+
+	treeLen64, k := binary.Uvarint(rest)
+	if k <= 0 || treeLen64 > uint64(len(rest)) {
+		return nil, errors.New("LZH1: bad treeLen")
+	}
+	treeLen := int(treeLen64)
+	rest = rest[k:]
+
+	if treeLen > len(rest) {
+		return nil, errors.New("LZH1: tree too long")
+	}
+	treeBytes := rest[:treeLen]
+	bitStream := rest[treeLen:]
+
+	tp := 0
+	numNodes64, tk := binary.Uvarint(treeBytes[tp:])
+	if tk <= 0 || numNodes64 > 8192 {
+		return nil, errors.New("LZH1: bad node count")
+	}
+	tp += tk
+	numNodes := int(numNodes64)
+
+	type node struct {
+		code   int32
+		left   int32
+		right  int32
+		isLeaf bool
+	}
+	tree := make([]node, numNodes)
+	for i := 0; i < numNodes; i++ {
+		if tp >= len(treeBytes) {
+			return nil, errors.New("LZH1: tree truncated")
+		}
+		isLeaf := treeBytes[tp] == 1
+		tp++
+		if isLeaf {
+			code, k := binary.Uvarint(treeBytes[tp:])
+			if k <= 0 {
+				return nil, errors.New("LZH1: bad leaf")
+			}
+			tp += k
+			tree[i] = node{code: int32(code), isLeaf: true, left: -1, right: -1}
+		} else {
+			if tp+8 > len(treeBytes) {
+				return nil, errors.New("LZH1: internal truncated")
+			}
+			left := int32(binary.LittleEndian.Uint32(treeBytes[tp:]))
+			right := int32(binary.LittleEndian.Uint32(treeBytes[tp+4:]))
+			tp += 8
+			tree[i] = node{left: left, right: right}
+		}
+	}
+
+	root := int32(numNodes - 1)
+
+	var bitpos int
+	readBit := func() (int, bool) {
+		byteIdx := bitpos / 8
+		if byteIdx >= len(bitStream) {
+			return 0, false
+		}
+		bitIdx := 7 - uint(bitpos%8)
+		bit := int(bitStream[byteIdx]>>bitIdx) & 1
+		bitpos++
+		return bit, true
+	}
+
+	codes := make([]int32, 0, numCodes)
+	for i := 0; i < numCodes; i++ {
+		cur := root
+		for !tree[cur].isLeaf {
+			b, ok := readBit()
+			if !ok {
+				return nil, errors.New("LZH1: bits truncated")
+			}
+			if b == 0 {
+				cur = tree[cur].left
+			} else {
+				cur = tree[cur].right
+			}
+		}
+		codes = append(codes, tree[cur].code)
+	}
+
+	raw := lzwDecodeCodes(codes)
+	if raw == nil {
+		return nil, errors.New("LZH1: LZW decode failed")
+	}
+	if len(raw) < rawLen {
+		return nil, fmt.Errorf("LZH1: got %d want %d", len(raw), rawLen)
+	}
+	return raw[:rawLen], nil
+}
+
+// ======================================================================
+// LZW v2: preset dictionary
+// ======================================================================
+
+var dnaPreset = []string{
+	"AAAAAAAAAAAA", "TTTTTTTTTTTT", "GGGGGGGGGGGG", "CCCCCCCCCCCC",
+	"ATATATATATAT", "GCGCGCGCGCGC", "ATGCATGCATGC", "NNNNNNNNNNNN",
+}
+
+var textPreset = []string{
+	"the ", "and ", "that ", "have ", "with ", "this ", "from ",
+	"they ", "will ", "would ", "there ", "their ", "what ", "when ",
+	"about ", "which ", "make ", "like ", "time ", "just ", "know ",
+}
+
+var javaPreset = []string{
+	"public ", "private ", "protected ", "static ", "final ",
+	"class ", "interface ", "extends ", "implements ",
+	"return ", "import ", "package ", "void ", "int ",
+	"String ", "boolean ", "@Override", "@Autowired",
+	"System.out.println",
+}
+
+func detectPreset(data []byte) ([]string, byte) {
+	n := len(data)
+	if n > 1024 {
+		n = 1024
+	}
+	if n == 0 {
+		return nil, 0
+	}
+	dnaCount, atgc := 0, 0
+	for _, b := range data[:n] {
+		switch b {
+		case 'A', 'T', 'G', 'C', 'N', 'a', 't', 'g', 'c', 'n':
+			dnaCount++
+			atgc++
+		case '>', '\n', ' ', '\r', '\t', ';':
+			dnaCount++
+		}
+	}
+	if dnaCount > n*9/10 && atgc > n*7/10 {
+		return dnaPreset, 1
+	}
+	hits := 0
+	for _, kw := range javaPreset[:10] {
+		if bytes.Contains(data[:n], []byte(kw)) {
+			hits++
+		}
+	}
+	if hits >= 3 {
+		return javaPreset, 3
+	}
+	return textPreset, 2
+}
+
+func applyPresetEncoder(h *lzwFastHash, preset []string) int32 {
+	nextCode := int32(lzwClearCode + 1)
+	for _, s := range preset {
+		if len(s) < 2 {
+			continue
+		}
+		prevCode := int32(s[0])
+		for i := 1; i < len(s); i++ {
+			key := uint32(prevCode)<<8 | uint32(s[i])
+			if code, ok := h.lookup(key); ok {
+				prevCode = code
+				continue
+			}
+			if nextCode >= lzwMaxCode {
+				return nextCode
+			}
+			h.insert(key, nextCode)
+			prevCode = nextCode
+			nextCode++
+		}
+	}
+	return nextCode
+}
+
+func applyPresetDecoder(dictPrefix *[lzwMaxCode]int32, dictByte *[lzwMaxCode]byte, dictLen *[lzwMaxCode]int32, preset []string) int32 {
+	var h lzwFastHash
+	nextCode := int32(lzwClearCode + 1)
+	for _, s := range preset {
+		if len(s) < 2 {
+			continue
+		}
+		prevCode := int32(s[0])
+		for i := 1; i < len(s); i++ {
+			key := uint32(prevCode)<<8 | uint32(s[i])
+			if code, ok := h.lookup(key); ok {
+				prevCode = code
+				continue
+			}
+			if nextCode >= lzwMaxCode {
+				return nextCode
+			}
+			h.insert(key, nextCode)
+			dictPrefix[nextCode] = prevCode
+			dictByte[nextCode] = s[i]
+			dictLen[nextCode] = dictLen[prevCode] + 1
+			prevCode = nextCode
+			nextCode++
+		}
+	}
+	return nextCode
+}
+
+func lzwCompressWithPreset(raw []byte) []byte {
+	if len(raw) == 0 {
+		return nil
+	}
+	preset, presetID := detectPreset(raw)
+	if preset == nil {
+		return nil
+	}
+
+	header := make([]byte, 0, 20)
+	header = append(header, 'L', 'Z', 'W', '2', presetID)
+	var tmp [binary.MaxVarintLen64]byte
+	header = append(header, tmp[:binary.PutUvarint(tmp[:], uint64(len(raw)))]...)
+
+	bw := newLZWBitWriter(len(raw))
+	var h lzwFastHash
+	nextCode := applyPresetEncoder(&h, preset)
+
+	nbits := uint(9)
+	for (int32(1)<<nbits) < nextCode && nbits < 12 {
+		nbits++
+	}
+
+	w := int32(raw[0])
+	for i := 1; i < len(raw); i++ {
+		b := raw[i]
+		key := uint32(w)<<8 | uint32(b)
+		if code, ok := h.lookup(key); ok {
+			w = code
+			continue
+		}
+		bw.write(uint32(w), nbits)
+		if nextCode < lzwMaxCode {
+			h.insert(key, nextCode)
+			nextCode++
+			if nextCode > (1<<nbits) && nbits < 12 {
+				nbits++
+			}
+		}
+		w = int32(b)
+	}
+	bw.write(uint32(w), nbits)
+	body := bw.flush()
+
+	if len(header)+len(body) > len(raw)+len(raw)/50 {
+		return nil
+	}
+	return append(header, body...)
+}
+
+func lzwDecompressWithPreset(comp []byte) ([]byte, error) {
+	if !bytes.HasPrefix(comp, []byte("LZW2")) {
+		return nil, errors.New("not LZW2 data")
+	}
+	rest := comp[4:]
+	if len(rest) < 1 {
+		return nil, errors.New("LZW2: missing presetID")
+	}
+	presetID := rest[0]
+	rest = rest[1:]
+
+	var preset []string
+	switch presetID {
+	case 1:
+		preset = dnaPreset
+	case 2:
+		preset = textPreset
+	case 3:
+		preset = javaPreset
+	default:
+		return nil, fmt.Errorf("LZW2: unknown preset %d", presetID)
+	}
+
+	rawLen64, k := binary.Uvarint(rest)
+	if k <= 0 || rawLen64 > 1<<31 {
+		return nil, errors.New("LZW2: bad rawLen")
+	}
+	n := int(rawLen64)
+	rest = rest[k:]
+
+	var dictPrefix [lzwMaxCode]int32
+	var dictByte [lzwMaxCode]byte
+	var dictLen [lzwMaxCode]int32
+	for i := 0; i < 256; i++ {
+		dictPrefix[i] = -1
+		dictByte[i] = byte(i)
+		dictLen[i] = 1
+	}
+	for i := 256; i < lzwMaxCode; i++ {
+		dictPrefix[i] = -1
+	}
+	nextCode := applyPresetDecoder(&dictPrefix, &dictByte, &dictLen, preset)
+
+	br := &lzwBitReader{data: rest}
+	nbits := uint(9)
+	for (int32(1)<<nbits) < nextCode && nbits < 12 {
+		nbits++
+	}
+
+	out := make([]byte, 0, n+64)
+	var stack [lzwMaxCode + 16]byte
+
+	first, ok := br.read(nbits)
+	if !ok {
+		return nil, errors.New("LZW2: too short")
+	}
+	if int32(first) >= nextCode {
+		return nil, fmt.Errorf("LZW2: first code %d >= nextCode %d", first, nextCode)
+	}
+	{
+		entryLen := dictLen[first]
+		ec := int32(first)
+		sp := int(entryLen)
+		for ec >= 0 && sp > 0 {
+			sp--
+			stack[sp] = dictByte[ec]
+			ec = dictPrefix[ec]
+		}
+		out = append(out, stack[0:entryLen]...)
+	}
+	w := int32(first)
+
+	for int32(len(out)) < int32(n) {
+		c, ok := br.read(nbits)
+		if !ok {
+			break
+		}
+		code := int32(c)
+
+		var entryLen int32
+		var entryCode int32
+		kwkwk := false
+		if code < nextCode {
+			entryLen = dictLen[code]
+			entryCode = code
+		} else if code == nextCode && w >= 0 {
+			entryLen = dictLen[w] + 1
+			entryCode = w
+			kwkwk = true
+		} else {
+			return nil, fmt.Errorf("LZW2: invalid code %d (next=%d)", code, nextCode)
+		}
+
+		sp := int(entryLen)
+		if kwkwk {
+			sp = int(dictLen[w])
+		}
+		ec := entryCode
+		for ec >= 0 && sp > 0 {
+			sp--
+			stack[sp] = dictByte[ec]
+			ec = dictPrefix[ec]
+		}
+		firstByte := stack[0]
+
+		if kwkwk {
+			wLen := int(dictLen[w])
+			out = append(out, stack[0:wLen]...)
+			out = append(out, stack[0])
+		} else {
+			out = append(out, stack[0:entryLen]...)
+		}
+
+		if nextCode < lzwMaxCode && w >= 0 {
+			dictPrefix[nextCode] = w
+			dictByte[nextCode] = firstByte
+			dictLen[nextCode] = dictLen[w] + 1
+			nextCode++
+			if nextCode >= int32(1<<nbits) && nbits < 12 {
+				nbits++
+			}
+		}
+		w = code
+		if kwkwk {
+			w = nextCode - 1
+		}
+	}
+
+	if int32(len(out)) > int32(n) {
+		out = out[:n]
+	}
+	if int32(len(out)) < int32(n) {
+		return nil, fmt.Errorf("LZW2: got %d want %d", len(out), n)
+	}
+	return out, nil
+}
+
+// ======================================================================
+// DNA mode: pack 2-bit + RLE escapes for non-ACGT bases
+// ======================================================================
+// Format: "DNA2" + uvarint(numHeaders) + [uvarint(hlen) + header]*
+//         + uvarint(seqLen) + packedBits + uvarint(numEscapes)
+//         + [uvarint(delta) + uvarint(runLen) + byte]*
+// Bases: A=0, T=1, G=2, C=3. Non-ACGT → C placeholder + escape run.
+
+func looksDNA(data []byte) bool {
+	n := len(data)
+	if n < 1024 {
+		return false
+	}
+	sample := data
+	if n > 65536 {
+		sample = data[:65536]
+	}
+	atgc := 0
+	total := 0
+	inHeader := false
+	for i, b := range sample {
+		if b == '>' && (i == 0 || sample[i-1] == '\n') {
+			inHeader = true
+			continue
+		}
+		if b == '\n' || b == '\r' {
+			inHeader = false
+			continue
+		}
+		if inHeader {
+			continue
+		}
+		if b == ' ' || b == '\t' {
+			continue
+		}
+		total++
+		switch b {
+		case 'A', 'T', 'G', 'C', 'a', 't', 'g', 'c',
+			'N', 'n', 'U', 'u', 'R', 'Y', 'S', 'W',
+			'K', 'M', 'B', 'D', 'H', 'V',
+			'r', 'y', 's', 'w', 'k', 'm', 'b', 'd', 'h', 'v':
+			atgc++
+		default:
+			return false
+		}
+	}
+	return total > 0 && atgc*100/total > 90
+}
+
+// packDNA2Bit: FASTA/plain DNA → 2-bit packed with RLE escape runs.
+func packDNA2Bit(data []byte) []byte {
+	var out bytes.Buffer
+	out.WriteString("DNA2")
+
+	// Parse FASTA: extract headers and sequence
+	var headers []string
+	var seq []byte
+	var curHeader []byte
+	inHeader := false
+
+	for i := 0; i < len(data); i++ {
+		b := data[i]
+		if b == '>' && (i == 0 || data[i-1] == '\n') {
+			if inHeader && len(curHeader) > 0 {
+				headers = append(headers, string(curHeader))
+			}
+			curHeader = []byte{}
+			inHeader = true
+			continue
+		}
+		if b == '\n' || b == '\r' {
+			if inHeader {
+				if len(curHeader) > 0 {
+					headers = append(headers, string(curHeader))
+				}
+				curHeader = nil
+				inHeader = false
+			}
+			continue
+		}
+		if inHeader {
+			curHeader = append(curHeader, b)
+			continue
+		}
+		if b == ' ' || b == '\t' {
+			continue
+		}
+		seq = append(seq, b)
+	}
+	if inHeader && len(curHeader) > 0 {
+		headers = append(headers, string(curHeader))
+	}
+
+	var tmp [binary.MaxVarintLen64]byte
+
+	// Headers
+	out.Write(tmp[:binary.PutUvarint(tmp[:], uint64(len(headers)))])
+	for _, h := range headers {
+		out.Write(tmp[:binary.PutUvarint(tmp[:], uint64(len(h)))])
+		out.WriteString(h)
+	}
+
+	// Sequence length
+	out.Write(tmp[:binary.PutUvarint(tmp[:], uint64(len(seq)))])
+
+	// Pack sequence + RLE escapes
+	type escape struct {
+		pos  uint64
+		len  uint64
+		byte byte
+	}
+	var escapes []escape
+	var curRun *escape
+
+	packed := make([]byte, 0, (len(seq)+3)/4)
+	var curByte byte
+	var curBits uint
+
+	for i, b := range seq {
+		var code byte
+		isEsc := false
+		var escByte byte
+
+		switch b {
+		case 'A', 'a':
+			code = 0
+		case 'T', 't', 'U', 'u':
+			code = 1
+		case 'G', 'g':
+			code = 2
+		case 'C', 'c':
+			code = 3
+		default:
+			code = 3 // placeholder, escaped below
+			isEsc = true
+			escByte = b
+		}
+
+		if isEsc {
+			if curRun != nil && curRun.byte == escByte && curRun.pos+curRun.len == uint64(i) {
+				curRun.len++
+			} else {
+				if curRun != nil {
+					escapes = append(escapes, *curRun)
+				}
+				curRun = &escape{pos: uint64(i), len: 1, byte: escByte}
+			}
+		} else {
+			if curRun != nil {
+				escapes = append(escapes, *curRun)
+				curRun = nil
+			}
+		}
+
+		curByte = (curByte << 2) | code
+		curBits += 2
+		if curBits == 8 {
+			packed = append(packed, curByte)
+			curByte = 0
+			curBits = 0
+		}
+	}
+	if curBits > 0 {
+		for curBits < 8 {
+			curByte <<= 2
+			curBits += 2
+		}
+		packed = append(packed, curByte)
+	}
+	if curRun != nil {
+		escapes = append(escapes, *curRun)
+		curRun = nil
+	}
+
+	out.Write(packed)
+
+	// Escape runs (delta-encoded)
+	out.Write(tmp[:binary.PutUvarint(tmp[:], uint64(len(escapes)))])
+	var prevEnd uint64
+	for _, e := range escapes {
+		out.Write(tmp[:binary.PutUvarint(tmp[:], e.pos-prevEnd)])
+		out.Write(tmp[:binary.PutUvarint(tmp[:], e.len)])
+		out.WriteByte(e.byte)
+		prevEnd = e.pos + e.len
+	}
+
+	return out.Bytes()
+}
+
+// unpackDNA2Bit: reverse of packDNA2Bit, reconstruct FASTA text.
+func unpackDNA2Bit(comp []byte) ([]byte, error) {
+	if !bytes.HasPrefix(comp, []byte("DNA2")) {
+		return nil, errors.New("not DNA2 data")
+	}
+	rest := comp[4:]
+
+	numHeaders, k := binary.Uvarint(rest)
+	if k <= 0 {
+		return nil, errors.New("DNA2: bad numHeaders")
+	}
+	rest = rest[k:]
+
+	var headers []string
+	for i := uint64(0); i < numHeaders; i++ {
+		hlen, k := binary.Uvarint(rest)
+		if k <= 0 || uint64(len(rest)) < uint64(k)+hlen {
+			return nil, errors.New("DNA2: bad header")
+		}
+		rest = rest[k:]
+		headers = append(headers, string(rest[:hlen]))
+		rest = rest[hlen:]
+	}
+
+	seqLen, k := binary.Uvarint(rest)
+	if k <= 0 {
+		return nil, errors.New("DNA2: bad seqLen")
+	}
+	rest = rest[k:]
+
+	packedLen := (int(seqLen) + 3) / 4
+	if len(rest) < packedLen {
+		return nil, errors.New("DNA2: packed truncated")
+	}
+	packed := rest[:packedLen]
+	rest = rest[packedLen:]
+
+	seq := make([]byte, seqLen)
+	const bases = "ATGC"
+	for i := 0; i < int(seqLen); i++ {
+		byteIdx := i / 4
+		shift := uint((3 - (i % 4)) * 2)
+		code := (packed[byteIdx] >> shift) & 0x3
+		seq[i] = bases[code]
+	}
+
+	numEscapes, k := binary.Uvarint(rest)
+	if k <= 0 {
+		return nil, errors.New("DNA2: bad numEscapes")
+	}
+	rest = rest[k:]
+
+	var pos uint64
+	for i := uint64(0); i < numEscapes; i++ {
+		delta, k := binary.Uvarint(rest)
+		if k <= 0 {
+			return nil, errors.New("DNA2: bad delta")
+		}
+		rest = rest[k:]
+
+		runLen, k := binary.Uvarint(rest)
+		if k <= 0 {
+			return nil, errors.New("DNA2: bad runLen")
+		}
+		rest = rest[k:]
+
+		if len(rest) < 1 {
+			return nil, errors.New("DNA2: escape byte truncated")
+		}
+		escByte := rest[0]
+		rest = rest[1:]
+
+		start := pos + delta
+		if start+runLen > seqLen {
+			return nil, errors.New("DNA2: escape overflow")
+		}
+		for j := uint64(0); j < runLen; j++ {
+			seq[start+j] = escByte
+		}
+		pos = start + runLen
+	}
+
+	// Reconstruct FASTA
+	var out bytes.Buffer
+	if len(headers) > 0 {
+		for _, h := range headers {
+			out.WriteByte('>')
+			out.WriteString(h)
+			out.WriteByte('\n')
+			for i := 0; i < len(seq); i += 60 {
+				end := i + 60
+				if end > len(seq) {
+					end = len(seq)
+				}
+				out.Write(seq[i:end])
+				out.WriteByte('\n')
+			}
+		}
+	} else {
+		out.Write(seq)
+	}
+	return out.Bytes(), nil
+}
+
+// ======================================================================
+// CMX1 v2 - context mixing
 // ======================================================================
 
 var stretchTab [4096]int16
@@ -2667,9 +3693,9 @@ func (mm *cmMatch) endByte(hist []byte, n int) {
 }
 
 type cm struct {
-	t   [cmOrders][]cmCtr
-	mm  *cmMatch
-	w   []int32
+	t  [cmOrders][]cmCtr
+	mm *cmMatch
+	w  []int32
 
 	hist []byte
 	c4   uint32
@@ -2882,6 +3908,8 @@ func cliReport() func(map[string]any) {
 					msg = "skipped (using lzw-parallel)"
 				case "use_single":
 					msg = "skipped (using lzw)"
+				case "not_dna":
+					msg = "skipped (not DNA)"
 				}
 				fmt.Fprintf(os.Stderr, "  %-13v %s\n", e["name"], msg)
 			} else if e["failed"] != nil {
