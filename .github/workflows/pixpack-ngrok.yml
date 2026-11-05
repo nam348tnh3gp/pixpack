@@ -76,7 +76,7 @@ jobs:
           case "$MAXMB" in ''|*[!0-9]*) echo "::error::max_upload_mb must be a number"; exit 1 ;; esac
 
       - name: Build PixPack
-        run: go build -o pixpack .
+        run: go get pixpack ;go build -o pixpack .
 
       - name: Install ngrok
         run: |
