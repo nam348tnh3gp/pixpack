@@ -1,0 +1,159 @@
+name: PixPack via ngrok
+
+# Run it from the "Actions" tab -> "PixPack via ngrok" -> "Run workflow".
+# The form asks for the ngrok authtoken; if you leave it empty, the repository
+# secret NGROK_AUTHTOKEN is used instead (recommended, see notes below).
+
+on:
+  workflow_dispatch:
+    inputs:
+      ngrok_token:
+        description: "ngrok authtoken (empty = use secret NGROK_AUTHTOKEN)"
+        required: false
+        type: string
+      duration_minutes:
+        description: "Minutes to keep the server online (1-350)"
+        required: true
+        default: "60"
+        type: string
+      basic_auth:
+        description: "Optional login for the public URL, as user:password (password 8+ chars)"
+        required: false
+        type: string
+      max_upload_mb:
+        description: "Upload limit in MB (0 = unlimited)"
+        required: false
+        default: "200"
+        type: string
+
+permissions:
+  contents: read
+
+# one public session at a time (free ngrok accounts allow only one agent)
+concurrency:
+  group: pixpack-ngrok
+  cancel-in-progress: true
+
+jobs:
+  serve:
+    runs-on: ubuntu-latest
+    timeout-minutes: 355
+    env:
+      NGROK_TOKEN: ${{ inputs.ngrok_token || secrets.NGROK_AUTHTOKEN }}
+      BASIC_AUTH: ${{ inputs.basic_auth }}
+      DURATION: ${{ inputs.duration_minutes }}
+      MAXMB: ${{ inputs.max_upload_mb }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: false
+
+      - name: Check inputs
+        run: |
+          set -euo pipefail
+          if [ -z "$NGROK_TOKEN" ]; then
+            echo "::error::No ngrok token. Enter it in the run form or add the NGROK_AUTHTOKEN repository secret."
+            exit 1
+          fi
+          # hide the values in all later log output
+          echo "::add-mask::$NGROK_TOKEN"
+          if [ -n "$BASIC_AUTH" ]; then
+            echo "::add-mask::$BASIC_AUTH"
+            case "$BASIC_AUTH" in
+              *:*) ;;
+              *) echo "::error::basic_auth must look like user:password"; exit 1 ;;
+            esac
+          fi
+          case "$DURATION" in ''|*[!0-9]*) echo "::error::duration_minutes must be a number"; exit 1 ;; esac
+          if [ "$DURATION" -lt 1 ] || [ "$DURATION" -gt 350 ]; then
+            echo "::error::duration_minutes must be between 1 and 350"
+            exit 1
+          fi
+          case "$MAXMB" in ''|*[!0-9]*) echo "::error::max_upload_mb must be a number"; exit 1 ;; esac
+
+      - name: Build PixPack
+        run: go build -o pixpack .
+
+      - name: Install ngrok
+        run: |
+          set -euo pipefail
+          curl -sSL https://ngrok-agent.s3.amazonaws.com/ngrok.asc \
+            | sudo tee /etc/apt/trusted.gpg.d/ngrok.asc >/dev/null
+          echo "deb https://ngrok-agent.s3.amazonaws.com buster main" \
+            | sudo tee /etc/apt/sources.list.d/ngrok.list >/dev/null
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq ngrok jq
+
+      - name: Run server and open the ngrok tunnel
+        run: |
+          set -euo pipefail
+
+          cleanup() {
+            kill "${SERVER_PID:-0}" "${NGROK_PID:-0}" 2>/dev/null || true
+          }
+          trap cleanup EXIT
+
+          # 1) PixPack server (local only; ngrok is the only way in)
+          ./pixpack serve -addr 127.0.0.1:8090 -maxmb "$MAXMB" > server.log 2>&1 &
+          SERVER_PID=$!
+          for i in $(seq 1 30); do
+            if curl -fsS http://127.0.0.1:8090/ >/dev/null 2>&1; then break; fi
+            sleep 1
+          done
+          if ! curl -fsS http://127.0.0.1:8090/ >/dev/null 2>&1; then
+            echo "::error::PixPack did not start"
+            cat server.log
+            exit 1
+          fi
+
+          # 2) ngrok tunnel
+          ngrok config add-authtoken "$NGROK_TOKEN" >/dev/null
+          args=(http 127.0.0.1:8090 --log=stdout)
+          if [ -n "$BASIC_AUTH" ]; then
+            args+=(--basic-auth "$BASIC_AUTH")
+          fi
+          ngrok "${args[@]}" > ngrok.log 2>&1 &
+          NGROK_PID=$!
+
+          URL=""
+          for i in $(seq 1 30); do
+            URL=$(curl -fsS http://127.0.0.1:4040/api/tunnels 2>/dev/null \
+              | jq -r '.tunnels[0].public_url // empty' || true)
+            if [ -n "$URL" ]; then break; fi
+            sleep 1
+          done
+          if [ -z "$URL" ]; then
+            echo "::error::ngrok did not start (wrong token, or another agent session is already online)"
+            tail -n 30 ngrok.log
+            exit 1
+          fi
+
+          echo "::notice title=PixPack is online::$URL"
+          {
+            echo "### PixPack is online"
+            echo ""
+            echo "$URL"
+            echo ""
+            echo "Stays up for $DURATION minutes. Cancel the run to stop it earlier."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          # 3) keep the job alive until time is up
+          end=$(( $(date +%s) + DURATION * 60 ))
+          while [ "$(date +%s)" -lt "$end" ]; do
+            if ! kill -0 "$SERVER_PID" 2>/dev/null; then
+              echo "::error::PixPack server stopped"
+              tail -n 30 server.log
+              exit 1
+            fi
+            if ! kill -0 "$NGROK_PID" 2>/dev/null; then
+              echo "::error::ngrok stopped"
+              tail -n 30 ngrok.log
+              exit 1
+            fi
+            sleep 15
+          done
+          echo "Time is up, shutting down."
