@@ -1199,6 +1199,16 @@ func optsFrom(get func(string) string) opts {
 	return o
 }
 
+// extMime covers common media types that the stdlib mime table (which
+// depends on the OS) may not know, so the browser can preview them.
+var extMime = map[string]string{
+	".mp4": "video/mp4", ".m4v": "video/mp4", ".webm": "video/webm", ".ogv": "video/ogg",
+	".mov": "video/quicktime", ".mkv": "video/x-matroska",
+	".mp3": "audio/mpeg", ".wav": "audio/wav", ".ogg": "audio/ogg", ".oga": "audio/ogg",
+	".opus": "audio/ogg", ".m4a": "audio/mp4", ".aac": "audio/aac", ".flac": "audio/flac",
+	".avif": "image/avif", ".bmp": "image/bmp",
+}
+
 func serve(addr string) {
 	mux := http.NewServeMux()
 
@@ -1379,7 +1389,11 @@ func serve(addr string) {
 			return
 		}
 		name := safeName(d.Name)
-		ct := mime.TypeByExtension(strings.ToLower(filepath.Ext(name)))
+		ext := strings.ToLower(filepath.Ext(name))
+		ct := mime.TypeByExtension(ext)
+		if ct == "" {
+			ct = extMime[ext]
+		}
 		if ct == "" {
 			ct = "application/octet-stream"
 		}
@@ -1451,7 +1465,7 @@ tr.best .mini>div{background:#16a34a}
 </div>
 <small>Scan with the phone camera to join. The password is sent to this server only to draw the QR and is not saved.</small>
 </div>
-<div id="fileBox" style="display:none"><label>Choose file</label><input type="file" id="file"><small id="finfo"></small></div>
+<div id="fileBox" style="display:none"><label>Choose file</label><input type="file" id="file"><small id="finfo"></small><div id="fpreview"></div></div>
 <div id="fitBox" style="display:none"><label><input type="checkbox" id="fit"> Shrink + JPEG compress to fit 1 QR (lossy)</label>
 <small>Unchecked: keep original image, auto-split into multiple images.</small></div>
 <div id="fmtBox" style="display:none">
@@ -1521,7 +1535,7 @@ function sync(){
 }
 $("mode").onchange=sync;$("format").onchange=sync;$("wsec").onchange=sync;
 $("wshow").onchange=function(){$("wpass").type=this.checked?"text":"password";};sync();
-$("file").onchange=function(){var f=this.files[0];$("finfo").textContent=f?(f.name+" — "+fmt(f.size)):"";};
+$("file").onchange=function(){var f=this.files[0];$("finfo").textContent=f?(f.name+" — "+fmt(f.size)):"";preview(f,f?f.name:"",$("fpreview"));};
 $("dfiles").onchange=function(){var t=0;for(var i=0;i<this.files.length;i++)t+=this.files[i].size;$("dfinfo").textContent=this.files.length?(this.files.length+" image(s) — "+fmt(t)):"";};
 function save(blob,name){var a=document.createElement("a");a.href=URL.createObjectURL(blob);a.download=name;document.body.appendChild(a);a.click();a.remove();}
 function build(){
@@ -1544,6 +1558,46 @@ function setBar(pre,p,title,detail){
   $(pre+"detail").textContent=detail||"";
 }
 function row(k,v){return "<tr><td>"+k+"</td><td>"+v+"</td></tr>";}
+var EXTMIME={mp4:"video/mp4",m4v:"video/mp4",webm:"video/webm",ogv:"video/ogg",mov:"video/quicktime",mkv:"video/x-matroska",mp3:"audio/mpeg",wav:"audio/wav",ogg:"audio/ogg",oga:"audio/ogg",opus:"audio/ogg",m4a:"audio/mp4",aac:"audio/aac",flac:"audio/flac",png:"image/png",jpg:"image/jpeg",jpeg:"image/jpeg",gif:"image/gif",webp:"image/webp",svg:"image/svg+xml",bmp:"image/bmp",avif:"image/avif",pdf:"application/pdf"};
+var TEXTEXT=["txt","md","json","csv","tsv","log","xml","html","htm","css","js","ts","go","py","c","h","cpp","java","rs","sh","yml","yaml","toml","ini","sql","conf"];
+function mimeOf(name,fallback){
+  var e=(name||"").split(".").pop().toLowerCase();
+  if(EXTMIME[e])return EXTMIME[e];
+  if(TEXTEXT.indexOf(e)>=0)return "text/plain";
+  return (fallback||"").split(";")[0];
+}
+// preview(blob,name,box,fallbackType): inline preview of video, audio, image, PDF or text.
+// Everything stays in the browser (blob URLs); text is shown with textContent only.
+function preview(blob,name,box,fallback){
+  box.innerHTML="";
+  if(!blob)return;
+  var mt=mimeOf(name,fallback||blob.type),k=mt.split("/")[0],el;
+  var note=function(t){var s=document.createElement("small");s.textContent=t;box.appendChild(s);};
+  if(k==="video"||k==="audio"){
+    el=document.createElement(k);el.controls=true;el.preload="metadata";
+    el.style.cssText="width:100%;margin-top:8px;max-height:70vh;background:#000";
+    el.onerror=function(){note("This browser cannot play this file ("+mt+"). Download it instead.");};
+    el.src=URL.createObjectURL(new Blob([blob],{type:mt}));
+    box.appendChild(el);
+  }else if(k==="image"){
+    el=new Image();el.style.cssText="max-width:100%;margin-top:8px";
+    el.onerror=function(){el.remove();note("Cannot preview this image.");};
+    el.src=URL.createObjectURL(new Blob([blob],{type:mt}));
+    box.appendChild(el);
+  }else if(mt==="application/pdf"){
+    el=document.createElement("iframe");el.style.cssText="width:100%;height:70vh;border:1px solid #cbd5e1;margin-top:8px";
+    el.src=URL.createObjectURL(new Blob([blob],{type:mt}));
+    box.appendChild(el);
+  }else if(mt==="text/plain"){
+    var lim=65536,fr=new FileReader();
+    fr.onload=function(){
+      var p=document.createElement("pre");p.style.maxHeight="50vh";p.style.overflow="auto";
+      p.textContent=fr.result;box.appendChild(p);
+      if(blob.size>lim)note("Preview shows the first "+fmt(lim)+" of "+fmt(blob.size)+".");
+    };
+    fr.readAsText(blob.slice(0,lim));
+  }
+}
 
 function skipLabel(r){
   switch(r.reason){
@@ -1725,12 +1779,10 @@ $("dgo").onclick=function(){
     h+="</table>";
     $("dstats").innerHTML=h;$("dstats").style.display="";
     var ct=xhr.getResponseHeader("Content-Type")||"";
-    if(ct.indexOf("text/plain")===0){
-      var fr2=new FileReader();fr2.onload=function(){var p=document.createElement("pre");p.textContent=fr2.result;$("dout").appendChild(p);};fr2.readAsText(xhr.response);
-      return;
-    }
-    if(ct.indexOf("image/")===0){var im=new Image();im.src=URL.createObjectURL(xhr.response);im.style.maxWidth="100%";im.style.marginTop="8px";$("dout").appendChild(im);}
-    var a=document.createElement("a");a.href=URL.createObjectURL(xhr.response);a.download=info.name||"decoded.bin";a.textContent="Download "+(info.name||"decoded.bin");a.style.display="block";a.style.marginTop="8px";$("dout").appendChild(a);
+    var fname=info.name||(info.text?"decoded.txt":"decoded.bin");
+    var pv=document.createElement("div");$("dout").appendChild(pv);
+    preview(xhr.response,fname,pv,ct);
+    var a=document.createElement("a");a.href=URL.createObjectURL(xhr.response);a.download=fname;a.textContent="Download "+fname;a.style.display="block";a.style.marginTop="8px";$("dout").appendChild(a);
   };
   xhr.send(fd);
 };
@@ -3821,12 +3873,12 @@ func init() {
 }
 
 const (
-	cmHashed = 7            // o2,o3,o4,o5,o6,word,sparse
-	cmCtx    = 2 + cmHashed // + direct o0, o1
-	cmNIn    = cmCtx*2 + 3  // 2 per ctx + 2 match + bias
-	cmSetsA  = 256          // mixer A selected by c0
-	cmSetsB  = 128          // mixer B selected by match length / bit position
-	cmSetsC  = 256          // mixer C selected by previous byte
+	cmHashed = 7             // o2,o3,o4,o5,o6,word,sparse
+	cmCtx    = 2 + cmHashed  // + direct o0, o1
+	cmNIn    = cmCtx*2 + 3   // 2 per ctx + 2 match + bias
+	cmSetsA  = 256           // mixer A selected by c0
+	cmSetsB  = 128           // mixer B selected by match length / bit position
+	cmSetsC  = 256           // mixer C selected by previous byte
 )
 
 // cmH mixes a 64-bit key into a well-distributed 32-bit hash.
@@ -3894,7 +3946,7 @@ func (a *cmAPM) pp(pr, cx int) int {
 		pr = 4095
 	}
 	s := int(stretchTab[pr]) + 2048 // 1..4095
-	lo := s >> 7                    // 0..31
+	lo := s >> 7                     // 0..31
 	w := s & 127
 	base := cx*33 + lo
 	if w >= 64 {
