@@ -87,6 +87,11 @@ type opts struct {
 	Channels  int    // pixel: 3 (RGB) or 4 (RGBA)
 	PixSide   int    // pixel: pixels per image side
 
+	WifiSSID   string // wifi mode: network name
+	WifiPass   string // wifi mode: password
+	WifiSec    string // wifi mode: WPA, WEP or nopass
+	WifiHidden bool   // wifi mode: hidden network
+
 	TargetPx int  // auto-size: min pixels per QR module (default 8)
 	NoAuto   bool // disable auto-size
 
@@ -703,6 +708,50 @@ func oneWithAutoSize(text string, o opts) ([][]byte, error) {
 	return [][]byte{img}, nil
 }
 
+// wifiEscape escapes the characters that are special in the WIFI: QR format.
+func wifiEscape(s string) string {
+	var b strings.Builder
+	for _, r := range s {
+		switch r {
+		case '\\', ';', ',', ':', '"':
+			b.WriteByte('\\')
+		}
+		b.WriteRune(r)
+	}
+	return b.String()
+}
+
+// wifiString builds the standard Wi-Fi join payload understood by the
+// Android and iOS cameras: WIFI:T:<WPA|WEP|nopass>;S:<ssid>;P:<pass>;H:true;;
+func wifiString(ssid, pass, sec string, hidden bool) (string, error) {
+	if ssid == "" {
+		return "", errors.New("Wi-Fi name (SSID) is empty")
+	}
+	switch strings.ToUpper(strings.TrimSpace(sec)) {
+	case "", "WPA", "WPA2", "WPA3":
+		sec = "WPA"
+	case "WEP":
+		sec = "WEP"
+	case "NOPASS", "NONE", "OPEN":
+		sec = "nopass"
+	default:
+		return "", fmt.Errorf("unknown security type %q (use WPA, WEP or nopass)", sec)
+	}
+	if sec != "nopass" && pass == "" {
+		return "", errors.New("password is empty (choose \"No password\" for an open network)")
+	}
+	var b strings.Builder
+	b.WriteString("WIFI:T:" + sec + ";S:" + wifiEscape(ssid) + ";")
+	if sec != "nopass" {
+		b.WriteString("P:" + wifiEscape(pass) + ";")
+	}
+	if hidden {
+		b.WriteString("H:true;")
+	}
+	b.WriteString(";")
+	return b.String(), nil
+}
+
 func generate(mode, text, name string, data []byte, o opts) ([][]byte, error) {
 	encode := func(s string) ([]byte, error) {
 		b, err := qrcode.Encode(s, o.RL, o.Size)
@@ -723,6 +772,12 @@ func generate(mode, text, name string, data []byte, o opts) ([][]byte, error) {
 			return nil, err
 		}
 		return oneWithAutoSize(u, o)
+	case "wifi":
+		w, err := wifiString(o.WifiSSID, o.WifiPass, o.WifiSec, o.WifiHidden)
+		if err != nil {
+			return nil, err
+		}
+		return oneWithAutoSize(w, o)
 	case "image":
 		if len(data) == 0 {
 			return nil, errors.New("no image provided")
@@ -947,9 +1002,10 @@ func main() {
 
 func usage() {
 	fmt.Println(`Usage:
-  pixpack <text|url|image|file> <content|path> [-o out.png] [-s 768] [-l M] [-c 900] [-fit]
+  pixpack <text|url|wifi|image|file> <content|path|ssid> [-o out.png] [-s 768] [-l M] [-c 900] [-fit]
                 [-fmt pixel|grid|qr] [-depth 16 -ch 4 -px 512] [-bits 2 -cell 3 -grid 256]
                 [-target-px 8] [-no-auto]
+  pixpack wifi <ssid> [-pass <password>|-pass -] [-sec WPA|WEP|nopass] [-hidden] [-o wifi.png]
   pixpack decode [-o dir] img1.png img2.png ...
   pixpack serve [-addr :8090]
 
@@ -986,6 +1042,9 @@ func runEncode() {
 	gridW := fs.Int("grid", 256, "grid: cells per side")
 	targetPx := fs.Int("target-px", 8, "auto-size: min pixels per QR module (4-16)")
 	noAuto := fs.Bool("no-auto", false, "disable auto-size (use -s exactly, may be unscannable)")
+	wpass := fs.String("pass", "", "wifi: password (use - to read it from stdin)")
+	wsec := fs.String("sec", "WPA", "wifi: security WPA, WEP or nopass")
+	whid := fs.Bool("hidden", false, "wifi: hidden network")
 	fs.Parse(os.Args[3:])
 
 	var text, name string
@@ -998,6 +1057,12 @@ func runEncode() {
 			var b []byte
 			b, err = io.ReadAll(os.Stdin)
 			text = strings.TrimRight(string(b), "\r\n")
+		}
+	case "wifi":
+		if *wpass == "-" {
+			var b []byte
+			b, err = io.ReadAll(os.Stdin)
+			*wpass = strings.TrimRight(string(b), "\r\n")
 		}
 	case "image", "file":
 		name = filepath.Base(input)
@@ -1013,7 +1078,8 @@ func runEncode() {
 	o := opts{RL: parseLevel(*level), Size: *size, Chunk: *chunk, MaxChunks: *max, Fit: *fit,
 		Format: *format, Bits: clampInt(*bits, 1, 8), Cell: clampInt(*cellPx, 1, 16), GridW: clampInt(*gridW, 16, 2048),
 		Depth: normDepth(*depth), Channels: normCh(*chn), PixSide: clampInt(*px, 16, 4096),
-		TargetPx: clampInt(*targetPx, 4, 16), NoAuto: *noAuto}
+		TargetPx: clampInt(*targetPx, 4, 16), NoAuto: *noAuto,
+		WifiSSID: input, WifiPass: *wpass, WifiSec: *wsec, WifiHidden: *whid}
 	o.Report = cliReport()
 	imgs, err := generate(mode, text, name, data, o)
 	if err != nil {
@@ -1121,6 +1187,11 @@ func optsFrom(get func(string) string) opts {
 		PixSide:   clampInt(atoiDef(get("px"), 512), 16, 4096),
 		TargetPx:  clampInt(atoiDef(get("targetpx"), 8), 4, 16),
 		NoAuto:    get("noauto") == "1",
+
+		WifiSSID:   get("ssid"),
+		WifiPass:   get("wpass"),
+		WifiSec:    get("wsec"),
+		WifiHidden: get("whidden") == "1",
 	}
 	if n, err := strconv.Atoi(get("chunk")); err == nil && n >= 100 && n <= 2000 {
 		o.Chunk = n
@@ -1216,12 +1287,14 @@ func serve(addr string) {
 				return
 			}
 			eff := oo.Format
-			if mode == "text" || mode == "url" || (mode == "image" && oo.Fit) || eff == "" {
+			if mode == "text" || mode == "url" || mode == "wifi" || (mode == "image" && oo.Fit) || eff == "" {
 				eff = "qr"
 			}
 			inBytes := len(data)
 			if mode == "text" || mode == "url" {
 				inBytes = len(r.FormValue("text"))
+			} else if mode == "wifi" {
+				inBytes = len(oo.WifiSSID) + len(oo.WifiPass)
 			}
 			uris := make([]string, len(imgs))
 			outBytes := 0
@@ -1363,10 +1436,21 @@ tr.best .mini>div{background:#16a34a}
 <select id="mode">
 <option value="text">Text</option>
 <option value="url">URL / Link</option>
+<option value="wifi">Wi-Fi network</option>
 <option value="image">Image</option>
 <option value="file">Any binary file</option>
 </select>
 <div id="textBox"><label>Content</label><textarea id="text" rows="4"></textarea></div>
+<div id="wifiBox" style="display:none">
+<label>Wi-Fi name (SSID)</label><input id="ssid" type="text" autocomplete="off">
+<label>Password</label><input id="wpass" type="password" autocomplete="off">
+<label style="font-weight:400"><input type="checkbox" id="wshow"> Show password</label>
+<div class="row">
+<div><label>Security</label><select id="wsec"><option value="WPA">WPA / WPA2 / WPA3</option><option value="WEP">WEP</option><option value="nopass">No password</option></select></div>
+<div><label style="margin-top:24px"><input type="checkbox" id="whidden"> Hidden network</label></div>
+</div>
+<small>Scan with the phone camera to join. The password is sent to this server only to draw the QR and is not saved.</small>
+</div>
 <div id="fileBox" style="display:none"><label>Choose file</label><input type="file" id="file"><small id="finfo"></small></div>
 <div id="fitBox" style="display:none"><label><input type="checkbox" id="fit"> Shrink + JPEG compress to fit 1 QR (lossy)</label>
 <small>Unchecked: keep original image, auto-split into multiple images.</small></div>
@@ -1426,19 +1510,24 @@ function esc(s){return String(s).replace(/[&<>"]/g,function(c){return {"&":"&amp
 function sync(){
   var m=$("mode").value,f=(m==="file"||m==="image");
   $("fileBox").style.display=f?"":"none";
-  $("textBox").style.display=f?"none":"";
+  var w=(m==="wifi");
+  $("textBox").style.display=(f||w)?"none":"";
+  $("wifiBox").style.display=w?"":"none";
+  $("wpass").disabled=(w&&$("wsec").value==="nopass");
   $("fitBox").style.display=(m==="image")?"":"none";
   $("fmtBox").style.display=f?"":"none";
   $("gridBox").style.display=(f&&$("format").value==="grid")?"":"none";
   $("pixBox").style.display=(f&&$("format").value==="pixel")?"":"none";
 }
-$("mode").onchange=sync;$("format").onchange=sync;sync();
+$("mode").onchange=sync;$("format").onchange=sync;$("wsec").onchange=sync;
+$("wshow").onchange=function(){$("wpass").type=this.checked?"text":"password";};sync();
 $("file").onchange=function(){var f=this.files[0];$("finfo").textContent=f?(f.name+" — "+fmt(f.size)):"";};
 $("dfiles").onchange=function(){var t=0;for(var i=0;i<this.files.length;i++)t+=this.files[i].size;$("dfinfo").textContent=this.files.length?(this.files.length+" image(s) — "+fmt(t)):"";};
 function save(blob,name){var a=document.createElement("a");a.href=URL.createObjectURL(blob);a.download=name;document.body.appendChild(a);a.click();a.remove();}
 function build(){
   var fd=new FormData();
   fd.append("mode",$("mode").value);fd.append("text",$("text").value);
+  fd.append("ssid",$("ssid").value);fd.append("wpass",$("wpass").value);fd.append("wsec",$("wsec").value);fd.append("whidden",$("whidden").checked?"1":"0");
   fd.append("size",$("size").value);fd.append("level",$("level").value);
   fd.append("fit",$("fit").checked?"1":"0");
   fd.append("format",$("format").value);fd.append("bits",$("bits").value);
