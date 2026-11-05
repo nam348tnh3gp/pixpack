@@ -87,6 +87,9 @@ type opts struct {
 	Channels  int    // pixel: 3 (RGB) or 4 (RGBA)
 	PixSide   int    // pixel: pixels per image side
 
+	TargetPx int  // auto-size: min pixels per QR module (default 8)
+	NoAuto   bool // disable auto-size
+
 	Report func(map[string]any) // receives progress events (may be nil)
 }
 
@@ -401,11 +404,12 @@ func packWith(name string, data []byte, report func(map[string]any)) ([]byte, er
 	}
 	if !huge && !noSlow {
 		run("CMX1", func() []byte {
-			c := cmCompress(raw)
-			if len(raw) <= 256<<10 {
-				if d, err := cmDecompress(c); err != nil || !bytes.Equal(d, raw) {
-					return nil
-				}
+			if len(raw) > 8<<20 {
+				return cmCompress(raw)
+			}
+			c, ok := cmCompressVerified(raw)
+			if !ok {
+				return nil
 			}
 			return c
 		})
@@ -644,6 +648,61 @@ func normalizeURL(raw string) (string, error) {
 	return u.String(), nil
 }
 
+// autoQRSize returns the minimum image size (px) such that each QR
+// module is at least targetModulePx pixels wide. Uses q.Bitmap() to
+// get the exact module count — no pixel scanning, no guessing.
+//
+// The QR image produced by skip2/go-qrcode always contains the standard
+// 4-module quiet zone on each side, so total side = (modules+8)*k for
+// some integer k >= 1. We pick the size so that k >= targetModulePx.
+func autoQRSize(text string, level qrcode.RecoveryLevel, targetModulePx int) (size, modules int, err error) {
+	if targetModulePx <= 0 {
+		targetModulePx = 8
+	}
+	q, err := qrcode.New(text, level)
+	if err != nil {
+		return 0, 0, fmt.Errorf("cannot encode QR (content too large for level %v): %w", level, err)
+	}
+	modules = len(q.Bitmap()) // exact: 17 + 4*version
+	totalMods := modules + 8  // +4 quiet zone on each side
+	needed := totalMods * targetModulePx
+	if needed < 128 {
+		needed = 128
+	}
+	if needed > 4096 {
+		needed = 4096
+	}
+	return needed, modules, nil
+}
+
+// oneWithAutoSize encodes a single text/url string. If o.Size is too
+// small for the chosen error-correction level, it is increased so every
+// module is >= o.TargetPx pixels. Disabled when o.NoAuto is true.
+func oneWithAutoSize(text string, o opts) ([][]byte, error) {
+	actualSize := o.Size
+	if !o.NoAuto {
+		needed, modules, err := autoQRSize(text, o.RL, o.TargetPx)
+		if err != nil {
+			return nil, err
+		}
+		if needed > actualSize {
+			o.emit(map[string]any{
+				"type":      "autosize",
+				"from":      actualSize,
+				"to":        needed,
+				"modules":   modules,
+				"target_px": o.TargetPx,
+			})
+			actualSize = needed
+		}
+	}
+	img, err := qrcode.Encode(text, o.RL, actualSize)
+	if err != nil {
+		return nil, fmt.Errorf("cannot create QR (content too large for level %v): %w", o.RL, err)
+	}
+	return [][]byte{img}, nil
+}
+
 func generate(mode, text, name string, data []byte, o opts) ([][]byte, error) {
 	encode := func(s string) ([]byte, error) {
 		b, err := qrcode.Encode(s, o.RL, o.Size)
@@ -652,26 +711,18 @@ func generate(mode, text, name string, data []byte, o opts) ([][]byte, error) {
 		}
 		return b, nil
 	}
-	one := func(s string) ([][]byte, error) {
-		b, err := encode(s)
-		if err != nil {
-			return nil, err
-		}
-		return [][]byte{b}, nil
-	}
-
 	switch mode {
 	case "text":
 		if text == "" {
 			return nil, errors.New("content is empty")
 		}
-		return one(text)
+		return oneWithAutoSize(text, o)
 	case "url":
 		u, err := normalizeURL(text)
 		if err != nil {
 			return nil, err
 		}
-		return one(u)
+		return oneWithAutoSize(u, o)
 	case "image":
 		if len(data) == 0 {
 			return nil, errors.New("no image provided")
@@ -681,7 +732,7 @@ func generate(mode, text, name string, data []byte, o opts) ([][]byte, error) {
 			if err != nil {
 				return nil, err
 			}
-			return one(uri)
+			return oneWithAutoSize(uri, o)
 		}
 		fallthrough
 	case "file":
@@ -898,8 +949,14 @@ func usage() {
 	fmt.Println(`Usage:
   pixpack <text|url|image|file> <content|path> [-o out.png] [-s 768] [-l M] [-c 900] [-fit]
                 [-fmt pixel|grid|qr] [-depth 16 -ch 4 -px 512] [-bits 2 -cell 3 -grid 256]
+                [-target-px 8] [-no-auto]
   pixpack decode [-o dir] img1.png img2.png ...
-  pixpack serve [-addr :8090]`)
+  pixpack serve [-addr :8090]
+
+Auto-size (text/url/image -fit):
+  If -s is too small for the chosen -l level, the image is grown so
+  every QR module is at least -target-px pixels (default 8).
+  Use -no-auto to disable and keep -s exactly.`)
 }
 
 func fatal(err error) {
@@ -927,6 +984,8 @@ func runEncode() {
 	bits := fs.Int("bits", 2, "grid: bits/color channel (1-8), higher = denser but less robust")
 	cellPx := fs.Int("cell", 3, "grid: pixels per cell")
 	gridW := fs.Int("grid", 256, "grid: cells per side")
+	targetPx := fs.Int("target-px", 8, "auto-size: min pixels per QR module (4-16)")
+	noAuto := fs.Bool("no-auto", false, "disable auto-size (use -s exactly, may be unscannable)")
 	fs.Parse(os.Args[3:])
 
 	var text, name string
@@ -953,7 +1012,8 @@ func runEncode() {
 
 	o := opts{RL: parseLevel(*level), Size: *size, Chunk: *chunk, MaxChunks: *max, Fit: *fit,
 		Format: *format, Bits: clampInt(*bits, 1, 8), Cell: clampInt(*cellPx, 1, 16), GridW: clampInt(*gridW, 16, 2048),
-		Depth: normDepth(*depth), Channels: normCh(*chn), PixSide: clampInt(*px, 16, 4096)}
+		Depth: normDepth(*depth), Channels: normCh(*chn), PixSide: clampInt(*px, 16, 4096),
+		TargetPx: clampInt(*targetPx, 4, 16), NoAuto: *noAuto}
 	o.Report = cliReport()
 	imgs, err := generate(mode, text, name, data, o)
 	if err != nil {
@@ -1059,6 +1119,8 @@ func optsFrom(get func(string) string) opts {
 		Depth:     normDepth(atoiDef(get("depth"), 16)),
 		Channels:  normCh(atoiDef(get("ch"), 4)),
 		PixSide:   clampInt(atoiDef(get("px"), 512), 16, 4096),
+		TargetPx:  clampInt(atoiDef(get("targetpx"), 8), 4, 16),
+		NoAuto:    get("noauto") == "1",
 	}
 	if n, err := strconv.Atoi(get("chunk")); err == nil && n >= 100 && n <= 2000 {
 		o.Chunk = n
@@ -1286,6 +1348,15 @@ tr.best td{font-weight:600}
 .mini{height:8px;background:#e2e8f0;border-radius:4px;overflow:hidden;margin-bottom:2px}
 .mini>div{height:100%;background:#94a3b8}
 tr.best .mini>div{background:#16a34a}
+.kv{display:grid;grid-template-columns:auto 1fr;gap:4px 12px;font-size:14px;margin:8px 0}
+.kv>b{color:#0f172a;font-weight:600}
+.kv>span{color:#334155}
+.badge{display:inline-block;padding:2px 8px;border-radius:999px;font-size:12px;font-weight:600;vertical-align:middle;margin-left:6px}
+.badge.auto{background:#fef3c7;color:#92400e;border:1px solid #f59e0b}
+.badge.manual{background:#e0e7ff;color:#3730a3;border:1px solid #818cf8}
+.badge.ok{background:#dcfce7;color:#166534;border:1px solid #22c55e}
+.arrow{color:#64748b;font-weight:400;margin:0 4px}
+.hint{color:#64748b;font-size:12px;margin-top:6px}
 </style></head><body>
 <h2>Encode → Image</h2>
 <label>Mode</label>
@@ -1314,9 +1385,14 @@ tr.best .mini>div{background:#16a34a}
 </div></div>
 </div>
 <div class="row">
-<div><label>Image size (px)</label><input id="size" type="number" value="768" min="128" max="2048"></div>
+<div><label>Image size (px)</label><input id="size" type="number" value="768" min="128" max="4096"></div>
 <div><label>Error correction</label><select id="level"><option>L</option><option selected>M</option><option>Q</option><option>H</option></select></div>
 </div>
+<div class="row">
+<div><label>Target module px</label><input id="targetpx" type="number" value="8" min="4" max="16"></div>
+<div><label style="margin-top:24px"><input type="checkbox" id="noauto"> Disable auto-size</label></div>
+</div>
+<small>Auto-size grows the image if modules would be &lt; target px (QR would be unscannable).</small>
 <button id="go">Encode</button>
 
 <div class="card" id="eprog" style="display:none">
@@ -1368,6 +1444,7 @@ function build(){
   fd.append("format",$("format").value);fd.append("bits",$("bits").value);
   fd.append("cell",$("cell").value);fd.append("gridw",$("gridw").value);
   fd.append("depth",$("depth").value);fd.append("ch",$("chn").value);fd.append("px",$("px").value);
+  fd.append("targetpx",$("targetpx").value);fd.append("noauto",$("noauto").checked?"1":"0");
   if($("file").files[0])fd.append("file",$("file").files[0]);
   return fd;
 }
@@ -1391,7 +1468,9 @@ function skipLabel(r){
   return "skipped";
 }
 
-function render(d,rows,pack){
+function render(d,rows,pack,autoInfo){
+  var oldQD=document.getElementById("qrDetail");
+  if(oldQD)oldQD.parentNode.removeChild(oldQD);
   var h="";
   if(d.precompressed){
     h+="<div class=\"notice\" style=\"background:#fef3c7;border:1px solid #f59e0b;color:#78350f;padding:10px;border-radius:8px;margin-bottom:12px\">";
@@ -1414,6 +1493,42 @@ function render(d,rows,pack){
   h+=row("Processing time",(d.ms/1000).toFixed(2)+" s");
   h+="</table>";
   $("stats").innerHTML=h;$("stats").style.display="";
+
+  // ---- QR detail card ----
+  // Only render QR detail card for QR format with real metadata.
+  var showQR = (d.format === "qr") && (d.qr_modules > 0 || !!autoInfo);
+  if(showQR){
+    var mods = d.qr_modules || (autoInfo && autoInfo.modules);
+    var ver  = d.qr_version || (autoInfo && autoInfo.version);
+    var px   = d.qr_px;
+    var mpx  = d.qr_module_px || (autoInfo && autoInfo.module_px);
+    var tgt  = d.qr_target_px || (autoInfo && autoInfo.target_px);
+    var lvl  = d.qr_level;
+    var wasAuto = !!(autoInfo || (px && tgt && mpx && mpx + 0.01 >= tgt && px > (autoInfo?autoInfo.from:0)));
+    // more reliable: autoInfo present means auto-adjust happened
+    wasAuto = !!autoInfo;
+
+    var q="<h3>QR detail"+(wasAuto?'<span class="badge auto">auto-sized</span>':'<span class="badge manual">manual size</span>')+"</h3>";
+    q+='<div class="kv">';
+    if(ver) q+="<b>Version</b><span>v"+ver+"</span>";
+    if(mods) q+="<b>Modules</b><span>"+mods+" × "+mods+"</span>";
+    if(px) q+="<b>Rendered size</b><span>"+px+" × "+px+" px</span>";
+    if(mpx) q+="<b>Module px</b><span>"+mpx.toFixed(2)+" px/module</span>";
+    if(tgt) q+="<b>Target px</b><span>≥ "+tgt+" px/module"+(mpx&&mpx+0.01<tgt?' <span style="color:#b91c1c">(below target)</span>':' <span class="badge ok">ok</span>')+"</span>";
+    if(lvl) q+="<b>EC level</b><span>"+lvl+"</span>";
+    q+="</div>";
+
+    if(wasAuto){
+      q+='<div class="hint">Auto-size changed the image from <b>'+autoInfo.from+'px</b> <span class="arrow">→</span> <b>'+autoInfo.to+'px</b> '+
+         'so each module is at least '+autoInfo.target_px+'px (otherwise phones may fail to scan).</div>';
+    }else{
+      q+='<div class="hint">Auto-size did not trigger — the requested size already gives ≥'+ (tgt||8) +'px per module.</div>';
+    }
+    q+='<div style="margin-top:8px"><button class="sec" style="width:auto;padding:6px 12px;font-size:13px" onclick="document.getElementById(\'qrDetail\').style.display=\'none\'">Hide</button></div>';
+    var card=document.createElement("div");card.className="card";card.id="qrDetail";
+    card.innerHTML=q;
+    $("stats").parentNode.insertBefore(card,$("stats").nextSibling);
+  }
 
   if(rows.length){
     var rs=rows.slice().sort(function(a,b){return (a.size||1e18)-(b.size||1e18);});
@@ -1448,15 +1563,23 @@ function render(d,rows,pack){
 $("go").onclick=function(){
   $("err").textContent="";$("out").innerHTML="";
   $("stats").style.display="none";$("algos").style.display="none";
+  var oldQD=document.getElementById("qrDetail");
+  if(oldQD)oldQD.parentNode.removeChild(oldQD);
   var fd=build();fd.append("stream","1");
   var xhr=new XMLHttpRequest();xhr.open("POST","/api/encode");
-  var pos=0,total=0,doneN=0,rows=[],pack=null,finished=false;
+  var pos=0,total=0,doneN=0,rows=[],pack=null,finished=false,autoInfo=null;
   showProg("eprog",true);setBar("e",0,"Uploading…","");
   xhr.upload.onprogress=function(e){if(e.lengthComputable)setBar("e",e.loaded/e.total*100,"Uploading",fmt(e.loaded)+" / "+fmt(e.total));};
   xhr.upload.onload=function(){setBar("e",0,"Server is processing…","");};
   function handle(e){
     if(e.error){$("err").textContent=e.error;showProg("eprog",false);finished=true;return;}
     if(e.type==="stage")setBar("e",0,e.msg,"");
+    else if(e.type==="autosize"){
+      autoInfo=e;
+      setBar("e",5,"Auto-sizing QR",
+        "size "+e.from+"px → "+e.to+"px (v"+e.version+", modules="+e.modules+
+        ", target "+e.target_px+"px/module)");
+    }
     else if(e.type==="packstart"){total=e.total;doneN=0;rows=[];setBar("e",0,"Compressing","0/"+total+" algorithms");}
     else if(e.type==="algo"){
       rows.push(e);
@@ -1466,7 +1589,7 @@ $("go").onclick=function(){
     }
     else if(e.type==="pack")pack=e;
     else if(e.type==="progress")setBar("e",e.done/e.total*100,"Creating images",e.done+"/"+e.total);
-    else if(e.type==="done"){finished=true;setBar("e",100,"Done",(e.ms/1000).toFixed(2)+" s");render(e,rows,pack);}
+    else if(e.type==="done"){finished=true;setBar("e",100,"Done",(e.ms/1000).toFixed(2)+" s");render(e,rows,pack,autoInfo);}
   }
   function consume(){
     var t=xhr.responseText,nl;
@@ -3542,12 +3665,36 @@ func unpackDNA2Bit(comp []byte) ([]byte, error) {
 }
 
 // ======================================================================
-// CMX1 v2 - context mixing
+// CMX1 v3 - context mixing (lpaq-style, reduced prototype made stronger)
+//
+// Compared with v2:
+//   - nibble-bucketed hash tables with check word + 2-way replacement
+//     (fewer collisions, unseen contexts give no input instead of noise)
+//   - two inputs per context: stretch(p) and (p-0.5)
+//   - extra contexts: word/bigram and sparse (skip) context
+//   - match model: verified length, learned confidence, stops predicting
+//     for the rest of a byte after the first wrong bit
+//   - 3 mixers (selected by c0, match state, previous byte) + 2nd layer
+//   - 3 APM/SSE stages working in the stretch domain
+//   - adaptive-rate counters via reciprocal table
+// NOTE: format changed, old CMX1 v2 streams are not decodable.
 // ======================================================================
 
 var stretchTab [4096]int16
 
+var squashTab [4096]int16
+
+// squash maps the stretch domain [-2047,2047] to a 12-bit probability (table lookup).
 func squash(d int) int {
+	if d > 2047 {
+		d = 2047
+	} else if d < -2047 {
+		d = -2047
+	}
+	return int(squashTab[d+2048])
+}
+
+func squashSlow(d int) int {
 	if d > 2047 {
 		return 4095
 	}
@@ -3562,7 +3709,12 @@ func squash(d int) int {
 	return (t[d]*(128-w) + t[d+1]*w + 64) >> 7
 }
 
+var cmDt [1024]int32
+
 func init() {
+	for x := -2047; x <= 2047; x++ {
+		squashTab[x+2048] = int16(squashSlow(x))
+	}
 	pi := 0
 	for x := -2047; x <= 2047; x++ {
 		v := squash(x)
@@ -3574,195 +3726,408 @@ func init() {
 	for i := pi; i < 4096; i++ {
 		stretchTab[i] = 2047
 	}
+	for n := range cmDt {
+		cmDt[n] = int32(131072 / (2*n + 3)) // 65536/(n+1.5)
+	}
 }
 
 const (
-	cmOrders = 6
-	cmNIn    = cmOrders + 2
-	cmNCtx   = 256
+	cmHashed = 7            // o2,o3,o4,o5,o6,word,sparse
+	cmCtx    = 2 + cmHashed // + direct o0, o1
+	cmNIn    = cmCtx*2 + 3  // 2 per ctx + 2 match + bias
+	cmSetsA  = 256          // mixer A selected by c0
+	cmSetsB  = 128          // mixer B selected by match length / bit position
+	cmSetsC  = 256          // mixer C selected by previous byte
 )
 
+// cmH mixes a 64-bit key into a well-distributed 32-bit hash.
+func cmH(x uint64) uint32 {
+	x *= 0x9E3779B97F4A7C15
+	x ^= x >> 29
+	x *= 0xBF58476D1CE4E5B9
+	x ^= x >> 32
+	return uint32(x)
+}
+
+// cmCtr: high 16 bits = P(1), low 16 bits = hit count (n==0 means unseen).
 type cmCtr uint32
 
-func (c *cmCtr) pr() int { return int(*c >> 16) }
+const cmCtrInit = cmCtr(uint32(32768) << 16)
 
-func (c *cmCtr) upd(y int) {
+func (c *cmCtr) upd(y, limit int) {
 	n := int(*c & 0xFFFF)
 	p := int(*c >> 16)
-	rate := n + 2
-	if rate > 32 {
-		rate = 32
+	p += int((int64(y*65535-p) * int64(cmDt[n])) >> 16)
+	if p < 16 {
+		p = 16
+	} else if p > 65519 {
+		p = 65519
 	}
-	p += (y*65535 - p) / rate
-	if p < 1 {
-		p = 1
-	} else if p > 65534 {
-		p = 65534
-	}
-	if n < 1023 {
+	if n < limit {
 		n++
 	}
 	*c = cmCtr(uint32(p)<<16 | uint32(n))
 }
 
-type cmMatch struct {
-	tab   []int32
-	mptr  int
-	mlen  int
-	mbyte byte
-	bitn  int
+// cmIn turns a counter into two mixer inputs; unseen contexts give 0,0.
+func cmIn(c cmCtr) (int, int) {
+	if c&0xFFFF == 0 {
+		return 0, 0
+	}
+	p := int(c>>16) >> 4
+	return int(stretchTab[p]), p - 2048
 }
 
-func cmTableSize(inputLen int) int {
-	switch {
-	case inputLen < 65536:
-		return 1 << 15
-	case inputLen < 262144:
-		return 1 << 17
-	case inputLen < 1048576:
-		return 1 << 19
-	default:
-		return 1 << 21
+// cmAPM refines a probability given a context, interpolating in the
+// stretch domain (33 bins) and updating the nearer bin.
+type cmAPM struct {
+	t   []uint16
+	idx int
+}
+
+func newAPM(n int) *cmAPM {
+	a := &cmAPM{t: make([]uint16, n*33)}
+	var row [33]uint16
+	for j := 0; j < 33; j++ {
+		row[j] = uint16(squash((j-16)*128) * 16)
 	}
+	for i := 0; i < n; i++ {
+		copy(a.t[i*33:], row[:])
+	}
+	return a
+}
+
+// pp takes pr in [0,4095] and returns a refined 12-bit probability.
+func (a *cmAPM) pp(pr, cx int) int {
+	if pr < 0 {
+		pr = 0
+	} else if pr > 4095 {
+		pr = 4095
+	}
+	s := int(stretchTab[pr]) + 2048 // 1..4095
+	lo := s >> 7                    // 0..31
+	w := s & 127
+	base := cx*33 + lo
+	if w >= 64 {
+		a.idx = base + 1
+	} else {
+		a.idx = base
+	}
+	return (int(a.t[base])*(128-w) + int(a.t[base+1])*w) >> 11
+}
+
+func (a *cmAPM) update(y int) {
+	g := y*65535 - int(a.t[a.idx])
+	a.t[a.idx] = uint16(int(a.t[a.idx]) + (g >> 7))
+}
+
+const cmMinMatch = 5
+
+// mixer updates are skipped when |error| (12-bit scale) is below this.
+const cmSkipErr = 16
+
+type cmMatch struct {
+	tab   []int32
+	ptr   int // index in hist of the predicted next byte
+	mlen  int
+	mbyte byte
+	sm    [64]cmCtr
+	smIdx int
 }
 
 func newCMMatch(capHint int) *cmMatch {
 	sz := 1 << 18
 	if capHint >= 1048576 {
-		sz = 1 << 20
+		sz = 1 << 21
 	} else if capHint >= 262144 {
-		sz = 1 << 19
+		sz = 1 << 20
 	}
-	return &cmMatch{tab: make([]int32, sz)}
+	mm := &cmMatch{tab: make([]int32, sz), smIdx: -1}
+	for i := range mm.sm {
+		mm.sm[i] = cmCtrInit
+	}
+	return mm
 }
 
-func (mm *cmMatch) predict() int {
+func (mm *cmMatch) lenQ() int {
+	if mm.mlen < 16 {
+		return mm.mlen
+	}
+	q := 16 + (mm.mlen-16)>>2
+	if q > 31 {
+		q = 31
+	}
+	return q
+}
+
+// predict returns the two match inputs for the current bit.
+func (mm *cmMatch) predict(c0, bitn int) (int, int) {
+	mm.smIdx = -1
 	if mm.mlen == 0 {
-		return 0
+		return 0, 0
 	}
-	bit := int(mm.mbyte>>(7-uint(mm.bitn))) & 1
-	conf := 400
-	if mm.mlen < 8 {
-		conf = 100 + mm.mlen*40
+	// the already coded bits of this byte must agree with the predicted byte
+	if (int(mm.mbyte)|256)>>(8-uint(bitn)) != c0 {
+		mm.mlen = 0
+		return 0, 0
 	}
-	if bit == 1 {
-		return conf
+	bit := int(mm.mbyte>>(7-uint(bitn))) & 1
+	mm.smIdx = mm.lenQ()*2 + bit
+	s := int(stretchTab[int(mm.sm[mm.smIdx]>>16)>>4])
+	l := mm.mlen
+	if l > 32 {
+		l = 32
 	}
-	return -conf
+	e := l * 32
+	if bit == 0 {
+		e = -e
+	}
+	return s, e
 }
 
+func (mm *cmMatch) update(y int) {
+	if mm.smIdx >= 0 {
+		mm.sm[mm.smIdx].upd(y, 255)
+	}
+}
+
+// endByte is called after hist[n] has been appended.
 func (mm *cmMatch) endByte(hist []byte, n int) {
 	if mm.mlen > 0 {
 		if mm.mbyte == hist[n] {
 			mm.mlen++
-			mm.mptr++
+			mm.ptr++
 		} else {
 			mm.mlen = 0
 		}
 	}
-
-	if n >= 4 {
+	if n >= cmMinMatch-1 {
 		var h uint32
-		for i := 0; i < 4; i++ {
-			h = h*0x9E3779B1 + uint32(hist[n-3+i])
+		for i := 0; i < cmMinMatch; i++ {
+			h = (h + uint32(hist[n-i]) + 1) * 0x2F0B4D3F
 		}
-		slot := int(h & uint32(len(mm.tab)-1))
-		prev := int(mm.tab[slot])
-		if mm.mlen == 0 && prev >= 4 && prev <= n {
-			ok := true
-			for i := 0; i < 4; i++ {
-				if hist[prev-4+i] != hist[n-3+i] {
-					ok = false
-					break
+		slot := int((h ^ h>>15) & uint32(len(mm.tab)-1))
+		if mm.mlen == 0 {
+			cand := int(mm.tab[slot])
+			if cand > 0 && cand <= n {
+				l := 0
+				for l < 64 && cand-1-l >= 0 && hist[cand-1-l] == hist[n-l] {
+					l++
 				}
-			}
-			if ok {
-				mm.mptr = prev
-				mm.mlen = 4
+				if l >= cmMinMatch {
+					mm.mlen = l
+					mm.ptr = cand
+				}
 			}
 		}
 		mm.tab[slot] = int32(n + 1)
 	}
-
-	if mm.mlen > 0 && mm.mptr < len(hist) {
-		mm.mbyte = hist[mm.mptr]
+	if mm.mlen > 0 && mm.ptr <= n {
+		mm.mbyte = hist[mm.ptr]
 	} else {
 		mm.mlen = 0
 	}
-	mm.bitn = 0
 }
 
 type cm struct {
-	t  [cmOrders][]cmCtr
+	d0 []cmCtr // order 0 direct
+	d1 []cmCtr // order 1 direct
+	h  [cmHashed][]cmCtr
 	mm *cmMatch
-	w  []int32
+
+	w  [3][]int32
+	w2 []int32
 
 	hist []byte
 	c4   uint32
 	c6   uint64
+	wh   uint64 // current word hash
+	pw   uint64 // previous word hash
 
-	hs  [cmOrders]uint32
-	idx [cmOrders]int
+	cx  [cmHashed]uint64
+	bb  [cmHashed]int
+	cp  [cmCtx]*cmCtr
+	lim [cmCtx]int
 	st  [cmNIn]int
 
-	mxc  int
-	pr   int
-	c0   int
-	bitn int
+	sel [3]int
+	dj  [3]int
+	pj  [3]int
+
+	apm1 *cmAPM
+	apm2 *cmAPM
+	apm3 *cmAPM
+
+	pr      int
+	prMixer int
+	c0      int
+	bitn    int
+	nib     int
+}
+
+func cmEntries(inputLen int) int {
+	e := 1 << 16
+	for e < inputLen*8 && e < 1<<22 {
+		e <<= 1
+	}
+	return e
 }
 
 func newCM(capHint int) *cm {
 	m := &cm{}
-	sz := cmTableSize(capHint)
-	sizes := [cmOrders]int{256, 1 << 16, sz, sz, sz, sz}
-	for i := 0; i < cmOrders; i++ {
-		m.t[i] = make([]cmCtr, sizes[i])
-		init := cmCtr(uint32(32768) << 16)
-		for j := range m.t[i] {
-			m.t[i][j] = init
+	m.d0 = make([]cmCtr, 256)
+	m.d1 = make([]cmCtr, 1<<16)
+	for i := range m.d0 {
+		m.d0[i] = cmCtrInit
+	}
+	for i := range m.d1 {
+		m.d1[i] = cmCtrInit
+	}
+	e := cmEntries(capHint)
+	for i := 0; i < cmHashed; i++ {
+		m.h[i] = make([]cmCtr, e)
+	}
+	m.lim = [cmCtx]int{255, 255, 255, 255, 255, 255, 255, 127, 127}
+	m.mm = newCMMatch(capHint)
+	m.w[0] = make([]int32, cmSetsA*cmNIn)
+	m.w[1] = make([]int32, cmSetsB*cmNIn)
+	m.w[2] = make([]int32, cmSetsC*cmNIn)
+	for j := 0; j < 3; j++ {
+		for i := range m.w[j] {
+			m.w[j][i] = 6554 // ~0.1
 		}
 	}
-	m.mm = newCMMatch(capHint)
-	m.w = make([]int32, cmNCtx*cmNIn)
-	for i := range m.w {
-		m.w[i] = 1 << 14
+	m.w2 = make([]int32, 256*3)
+	for i := range m.w2 {
+		m.w2[i] = 21845 // ~1/3
 	}
+	m.apm1 = newAPM(256)
+	m.apm2 = newAPM(1 << 16)
+	m.apm3 = newAPM(1 << 16)
 	m.hist = make([]byte, 0, capHint)
 	m.c0 = 1
+	m.nib = 1
+	m.byteCtx()
+	m.buckets()
 	return m
 }
 
-func (m *cm) predict() int {
-	m.idx[0] = m.c0
-	m.st[0] = int(stretchTab[m.t[0][m.c0].pr()>>4])
-
-	i1 := int(m.c4&0xFF)<<8 | m.c0
-	m.idx[1] = i1
-	m.st[1] = int(stretchTab[m.t[1][i1].pr()>>4])
-
-	c0u := uint32(m.c0) * 0x9E3779B1
-	h2 := ((m.c4 & 0xFFFF) + c0u) * 0x85EBCA6B
-	m.idx[2] = int(h2 & uint32(len(m.t[2])-1))
-	m.st[2] = int(stretchTab[m.t[2][m.idx[2]].pr()>>4])
-	h3 := ((m.c4 & 0xFFFFFF) + c0u*2) * 0xC2B2AE35
-	m.idx[3] = int(h3 & uint32(len(m.t[3])-1))
-	m.st[3] = int(stretchTab[m.t[3][m.idx[3]].pr()>>4])
-	h4 := (m.c4 + c0u*3) * 0x6F4F2A1D
-	m.idx[4] = int(h4 & uint32(len(m.t[4])-1))
-	m.st[4] = int(stretchTab[m.t[4][m.idx[4]].pr()>>4])
-	h6 := uint32((m.c6 + uint64(c0u)*4) * 0x9E3779B97F4A7C15 >> 32)
-	m.idx[5] = int(h6 & uint32(len(m.t[5])-1))
-	m.st[5] = int(stretchTab[m.t[5][m.idx[5]].pr()>>4])
-
-	m.st[cmOrders] = m.mm.predict()
-	m.st[cmOrders+1] = 256
-
-	m.mxc = m.c0 * cmNIn
-	var sum int64
-	for k := 0; k < cmNIn; k++ {
-		sum += int64(m.w[m.mxc+k]) * int64(m.st[k])
+// byteCtx computes the per-byte context keys of the hashed models.
+func (m *cm) byteCtx() {
+	c4 := uint64(m.c4)
+	c6 := m.c6
+	var wk uint64
+	wk = m.wh*0x2F0B4D3F + m.pw*0x1F3D5B79
+	if m.wh == 0 {
+		wk += (c4 & 0xFF) << 40
 	}
-	d := int(sum >> 16)
+	v := [cmHashed]uint64{
+		c4 & 0xFFFF,
+		c4 & 0xFFFFFF,
+		c4,
+		c6 & 0xFFFFFFFFFF,
+		c6 & 0xFFFFFFFFFFFF,
+		wk,
+		(c4 >> 8) & 0xFFFF,
+	}
+	for i := 0; i < cmHashed; i++ {
+		m.cx[i] = (v[i]+1)*0x9E3779B97F4A7C15 + uint64(i+1)*0xD6E8FEB86659FD93
+	}
+}
+
+// lookup finds (or claims) the 16-slot bucket for hash h in table i.
+func (m *cm) lookup(i int, h uint32) int {
+	t := m.h[i]
+	mask := uint32(len(t)>>4 - 1)
+	chk := cmCtr(h | 1)
+	b0 := int(h&mask) << 4
+	if t[b0] == chk {
+		return b0
+	}
+	b1 := b0 ^ 16
+	if t[b1] == chk {
+		return b1
+	}
+	v := b0
+	if t[b0] != 0 {
+		if t[b1] == 0 || t[b1+1]&0xFFFF < t[b0+1]&0xFFFF {
+			v = b1
+		}
+	}
+	t[v] = chk
+	for k := 1; k < 16; k++ {
+		t[v+k] = cmCtrInit
+	}
+	return v
+}
+
+// buckets selects the bucket of every hashed model (at nibble boundaries).
+func (m *cm) buckets() {
+	for i := 0; i < cmHashed; i++ {
+		key := m.cx[i]
+		if m.bitn == 4 {
+			key += uint64(m.c0) * 0xA24BAED4963EE407
+		}
+		m.bb[i] = m.lookup(i, cmH(key))
+	}
+}
+
+func (m *cm) predict() int {
+	c1 := int(m.c4 & 0xFF)
+
+	m.cp[0] = &m.d0[m.c0]
+	m.cp[1] = &m.d1[c1<<8|m.c0]
+	for i := 0; i < cmHashed; i++ {
+		m.cp[2+i] = &m.h[i][m.bb[i]+m.nib]
+	}
+	for i := 0; i < cmCtx; i++ {
+		a, b := cmIn(*m.cp[i])
+		m.st[2*i] = a
+		m.st[2*i+1] = b
+	}
+	a, b := m.mm.predict(m.c0, m.bitn)
+	m.st[2*cmCtx] = a
+	m.st[2*cmCtx+1] = b
+	m.st[2*cmCtx+2] = 256
+
+	lq := m.mm.mlen
+	if lq > 15 {
+		lq = 15
+	}
+	m.sel[0] = m.c0 * cmNIn
+	m.sel[1] = (lq*8 + m.bitn) * cmNIn
+	m.sel[2] = c1 * cmNIn
+
+	// layer 1
+	for j := 0; j < 3; j++ {
+		w := m.w[j][m.sel[j] : m.sel[j]+cmNIn]
+		var sum int64
+		for k := 0; k < cmNIn; k++ {
+			sum += int64(w[k]) * int64(m.st[k])
+		}
+		d := int(sum >> 16)
+		if d > 2047 {
+			d = 2047
+		} else if d < -2047 {
+			d = -2047
+		}
+		m.dj[j] = d
+		p := squash(d)
+		if p < 1 {
+			p = 1
+		} else if p > 4095 {
+			p = 4095
+		}
+		m.pj[j] = p
+	}
+
+	// layer 2
+	w2 := m.w2[m.c0*3 : m.c0*3+3]
+	var sum2 int64
+	for j := 0; j < 3; j++ {
+		sum2 += int64(w2[j]) * int64(m.dj[j])
+	}
+	d := int(sum2 >> 16)
 	if d > 2047 {
 		d = 2047
 	} else if d < -2047 {
@@ -3774,48 +4139,105 @@ func (m *cm) predict() int {
 	} else if p > 4095 {
 		p = 4095
 	}
+	m.prMixer = p
+
+	// SSE / APM stages
+	p1 := m.apm1.pp(p, m.c0)
+	p2 := m.apm2.pp(p, c1<<8|m.c0)
+	p3 := m.apm3.pp(p, int(cmH(uint64(m.c4&0xFFFFFF)<<8|uint64(m.c0))>>16))
+	p = (p*2 + p1 + p2*2 + p3*3) >> 3
+	if p < 1 {
+		p = 1
+	} else if p > 4095 {
+		p = 4095
+	}
 	m.pr = p
 	return p
 }
 
 func (m *cm) update(y int) {
-	err := ((y << 12) - m.pr) * 12
-	for k := 0; k < cmNIn; k++ {
-		nw := m.w[m.mxc+k] + int32((int64(m.st[k])*int64(err))>>14)
+	// layer 1: every mixer trains on its OWN output
+	for j := 0; j < 3; j++ {
+		e := (y << 12) - m.pj[j]
+		if e > -cmSkipErr && e < cmSkipErr {
+			continue // already well predicted: skip the costly update
+		}
+		err := e * 10
+		w := m.w[j][m.sel[j] : m.sel[j]+cmNIn]
+		for k := 0; k < cmNIn; k++ {
+			nw := w[k] + int32((int64(m.st[k])*int64(err))>>14)
+			if nw > 1<<20 {
+				nw = 1 << 20
+			} else if nw < -(1 << 20) {
+				nw = -(1 << 20)
+			}
+			w[k] = nw
+		}
+	}
+	// layer 2 trains on the mixer output (before APM)
+	e2 := (y << 12) - m.prMixer
+	if e2 <= -cmSkipErr || e2 >= cmSkipErr {
+		m.updLayer2(e2 * 6)
+	}
+
+	for i := 0; i < cmCtx; i++ {
+		m.cp[i].upd(y, m.lim[i])
+	}
+	m.mm.update(y)
+	m.apm1.update(y)
+	m.apm2.update(y)
+	m.apm3.update(y)
+	m.advance(y)
+}
+
+func (m *cm) updLayer2(err2 int) {
+	w2 := m.w2[m.c0*3 : m.c0*3+3]
+	for j := 0; j < 3; j++ {
+		nw := w2[j] + int32((int64(m.dj[j])*int64(err2))>>14)
 		if nw > 1<<20 {
 			nw = 1 << 20
 		} else if nw < -(1 << 20) {
 			nw = -(1 << 20)
 		}
-		m.w[m.mxc+k] = nw
+		w2[j] = nw
 	}
+}
 
-	for i := 0; i < cmOrders; i++ {
-		m.t[i][m.idx[i]].upd(y)
-	}
-
+func (m *cm) advance(y int) {
 	m.c0 = m.c0<<1 | y
+	m.nib = m.nib<<1 | y
 	m.bitn++
-	if m.mm.mlen > 0 {
-		m.mm.bitn++
-	}
-	if m.bitn == 8 {
+	switch m.bitn {
+	case 4:
+		m.nib = 1
+		m.buckets()
+	case 8:
 		b := byte(m.c0 & 0xFF)
 		m.hist = append(m.hist, b)
 		m.c4 = m.c4<<8 | uint32(b)
 		m.c6 = (m.c6 << 8) | uint64(b)
+		if (b >= 'a' && b <= 'z') || (b >= 'A' && b <= 'Z') || b >= 128 {
+			lc := b
+			if b >= 'A' && b <= 'Z' {
+				lc = b + 32
+			}
+			m.wh = (m.wh + uint64(lc) + 1) * 0x9E3779B1
+		} else if m.wh != 0 {
+			m.pw = m.wh
+			m.wh = 0
+		}
 		m.mm.endByte(m.hist, len(m.hist)-1)
 		m.c0 = 1
 		m.bitn = 0
+		m.nib = 1
+		m.byteCtx()
+		m.buckets()
 	}
 }
 
-func cmCompress(raw []byte) []byte {
+// cmEncode runs the arithmetic coder and hands every output byte to emit.
+func cmEncode(raw []byte, emit func(byte)) {
 	m := newCM(len(raw))
-	var out bytes.Buffer
-	out.WriteString("CMX1")
-	var tmp [binary.MaxVarintLen64]byte
-	out.Write(tmp[:binary.PutUvarint(tmp[:], uint64(len(raw)))])
 	x1, x2 := uint32(0), uint32(0xffffffff)
 	for _, b := range raw {
 		for i := 7; i >= 0; i-- {
@@ -3829,38 +4251,34 @@ func cmCompress(raw []byte) []byte {
 			}
 			m.update(y)
 			for (x1^x2)&0xff000000 == 0 {
-				out.WriteByte(byte(x2 >> 24))
+				emit(byte(x2 >> 24))
 				x1 <<= 8
 				x2 = x2<<8 | 255
 			}
 		}
 	}
-	out.WriteByte(byte(x1 >> 24))
-	out.WriteByte(byte(x1 >> 16))
-	out.WriteByte(byte(x1 >> 8))
-	out.WriteByte(byte(x1))
+	emit(byte(x1 >> 24))
+	emit(byte(x1 >> 16))
+	emit(byte(x1 >> 8))
+	emit(byte(x1))
+}
+
+func cmHeader(n int) []byte {
+	var out bytes.Buffer
+	out.WriteString("CMX1")
+	var tmp [binary.MaxVarintLen64]byte
+	out.Write(tmp[:binary.PutUvarint(tmp[:], uint64(n))])
 	return out.Bytes()
 }
 
-func cmDecompress(comp []byte) ([]byte, error) {
-	if !bytes.HasPrefix(comp, []byte("CMX1")) {
-		return nil, errors.New("not CMX1 data")
-	}
-	n64, k := binary.Uvarint(comp[4:])
-	if k <= 0 || n64 > 1<<31 {
-		return nil, errors.New("CMX1 header corrupted")
-	}
-	n := int(n64)
-	in := comp[4+k:]
-	pos := 0
-	next := func() uint32 {
-		if pos < len(in) {
-			b := in[pos]
-			pos++
-			return uint32(b)
-		}
-		return 0
-	}
+func cmCompress(raw []byte) []byte {
+	out := bytes.NewBuffer(cmHeader(len(raw)))
+	cmEncode(raw, func(b byte) { out.WriteByte(b) })
+	return out.Bytes()
+}
+
+// cmDecodeCore decodes n bytes, pulling coder bytes from next().
+func cmDecodeCore(n int, next func() uint32) []byte {
 	x1, x2 := uint32(0), uint32(0xffffffff)
 	var x uint32
 	for i := 0; i < 4; i++ {
@@ -3886,7 +4304,104 @@ func cmDecompress(comp []byte) ([]byte, error) {
 			}
 		}
 	}
-	return m.hist, nil
+	return m.hist
+}
+
+func cmDecompress(comp []byte) ([]byte, error) {
+	if !bytes.HasPrefix(comp, []byte("CMX1")) {
+		return nil, errors.New("not CMX1 data")
+	}
+	n64, k := binary.Uvarint(comp[4:])
+	if k <= 0 || n64 > 1<<31 {
+		return nil, errors.New("CMX1 header corrupted")
+	}
+	in := comp[4+k:]
+	pos := 0
+	next := func() uint32 {
+		if pos < len(in) {
+			b := in[pos]
+			pos++
+			return uint32(b)
+		}
+		return 0
+	}
+	return cmDecodeCore(int(n64), next), nil
+}
+
+// cmPipe lets the verifying decoder consume bytes while the encoder is
+// still producing them, so verification costs no extra wall-clock time.
+type cmPipe struct {
+	mu   sync.Mutex
+	cv   *sync.Cond
+	buf  []byte
+	done bool
+}
+
+func newCmPipe() *cmPipe {
+	p := &cmPipe{}
+	p.cv = sync.NewCond(&p.mu)
+	return p
+}
+
+func (p *cmPipe) put(chunk []byte) {
+	p.mu.Lock()
+	p.buf = append(p.buf, chunk...)
+	p.mu.Unlock()
+	p.cv.Broadcast()
+}
+
+func (p *cmPipe) finish() {
+	p.mu.Lock()
+	p.done = true
+	p.mu.Unlock()
+	p.cv.Broadcast()
+}
+
+func (p *cmPipe) get(pos int) (byte, bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	for pos >= len(p.buf) && !p.done {
+		p.cv.Wait()
+	}
+	if pos < len(p.buf) {
+		return p.buf[pos], true
+	}
+	return 0, false
+}
+
+// cmCompressVerified compresses raw and, in parallel, decodes the stream
+// as it is produced. ok reports whether the round trip reproduced raw.
+func cmCompressVerified(raw []byte) (comp []byte, ok bool) {
+	out := bytes.NewBuffer(cmHeader(len(raw)))
+	p := newCmPipe()
+	res := make(chan bool, 1)
+	go func() {
+		pos := 0
+		next := func() uint32 {
+			b, got := p.get(pos)
+			if got {
+				pos++
+				return uint32(b)
+			}
+			return 0
+		}
+		res <- bytes.Equal(cmDecodeCore(len(raw), next), raw)
+	}()
+	pend := make([]byte, 0, 64)
+	cmEncode(raw, func(b byte) {
+		out.WriteByte(b)
+		pend = append(pend, b)
+		if len(pend) >= 64 {
+			p.put(pend)
+			pend = pend[:0]
+		}
+	})
+	if len(pend) > 0 {
+		p.put(pend)
+	}
+	p.finish()
+	ok = <-res
+	return out.Bytes(), ok
 }
 
 func cliReport() func(map[string]any) {
@@ -3929,6 +4444,9 @@ func cliReport() func(map[string]any) {
 			if pc, _ := e["precompressed"].(bool); pc {
 				fmt.Fprintf(os.Stderr, "[info] precompressed file detected — slow algorithms skipped\n")
 			}
+		case "autosize":
+			fmt.Fprintf(os.Stderr, "[auto-size] size: %v → %v (modules=%v, target %vpx/module)\n",
+				e["from"], e["to"], e["modules"], e["target_px"])
 		}
 	}
 }
