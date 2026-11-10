@@ -1433,8 +1433,9 @@ func serve(addr string) {
 }
 
 const indexHTML = `<!doctype html>
-<html lang="en"><head>
+<html lang="en" translate="no"><head>
 <meta charset="utf-8">
+<meta name="google" content="notranslate">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>PixPack</title>
 <style>
@@ -1470,6 +1471,8 @@ tr.best .mini>div{background:#16a34a}
 .badge.ok{background:#dcfce7;color:#166534;border:1px solid #22c55e}
 .arrow{color:#64748b;font-weight:400;margin:0 4px}
 .hint{color:#64748b;font-size:12px;margin-top:6px}
+.filepick{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-top:4px}
+.filelabel{color:#64748b;font-size:14px}
 </style></head><body>
 <h2>Encode → Image</h2>
 <label>Mode</label>
@@ -1491,7 +1494,15 @@ tr.best .mini>div{background:#16a34a}
 </div>
 <small>Scan with the phone camera to join. The password is sent to this server only to draw the QR and is not saved.</small>
 </div>
-<div id="fileBox" style="display:none"><label>Choose file</label><input type="file" id="file"><small id="finfo"></small><div id="fpreview"></div></div>
+<div id="fileBox" style="display:none">
+<label>Choose file</label>
+<div class="filepick">
+<input type="file" id="file" hidden>
+<button type="button" class="sec" id="fileBtn" style="width:auto;margin-top:4px">Browse…</button>
+<span id="fileLabel" class="filelabel">No file selected</span>
+</div>
+<small id="finfo"></small><div id="fpreview"></div>
+</div>
 <div id="fitBox" style="display:none"><label><input type="checkbox" id="fit"> Shrink + JPEG compress to fit 1 QR (lossy)</label>
 <small>Unchecked: keep original image, auto-split into multiple images.</small></div>
 <div id="fmtBox" style="display:none">
@@ -1534,7 +1545,11 @@ tr.best .mini>div{background:#16a34a}
 
 <h2>Decode image(s) → original file</h2>
 <label>Select image(s) — multiple allowed</label>
-<input type="file" id="dfiles" accept="image/*" multiple>
+<div class="filepick">
+<input type="file" id="dfiles" accept="image/*" multiple hidden>
+<button type="button" class="sec" id="dfilesBtn" style="width:auto;margin-top:4px">Browse…</button>
+<span id="dfilesLabel" class="filelabel">No file selected</span>
+</div>
 <small id="dfinfo"></small>
 <button id="dgo" class="sec">Decode</button>
 <div class="card" id="dprog" style="display:none">
@@ -1564,8 +1579,20 @@ function sync(){
 }
 $("mode").onchange=sync;$("format").onchange=sync;$("wsec").onchange=sync;
 $("wshow").onchange=function(){$("wpass").type=this.checked?"text":"password";};sync();
-$("file").onchange=function(){var f=this.files[0];$("finfo").textContent=f?(f.name+" — "+fmt(f.size)):"";preview(f,f?f.name:"",$("fpreview"));};
-$("dfiles").onchange=function(){var t=0;for(var i=0;i<this.files.length;i++)t+=this.files[i].size;$("dfinfo").textContent=this.files.length?(this.files.length+" image(s) — "+fmt(t)):"";};
+$("fileBtn").onclick=function(){$("file").click();};
+$("dfilesBtn").onclick=function(){$("dfiles").click();};
+$("file").onchange=function(){
+  var f=this.files[0];
+  $("fileLabel").textContent=f?f.name:"No file selected";
+  $("finfo").textContent=f?(f.name+" — "+fmt(f.size)):"";
+  preview(f,f?f.name:"",$("fpreview"));
+};
+$("dfiles").onchange=function(){
+  var n=this.files.length,t=0;
+  for(var i=0;i<n;i++)t+=this.files[i].size;
+  $("dfilesLabel").textContent=n?(n===1?this.files[0].name:(n+" files selected")):"No file selected";
+  $("dfinfo").textContent=n?(n+" image(s) — "+fmt(t)):"";
+};
 function save(blob,name){var a=document.createElement("a");a.href=URL.createObjectURL(blob);a.download=name;document.body.appendChild(a);a.click();a.remove();}
 function build(){
   var fd=new FormData();
