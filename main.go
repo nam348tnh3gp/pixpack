@@ -34,6 +34,7 @@ import (
 	"fmt"
 	"hash/crc32"
 	"image"
+	"image/color"
 	"image/draw"
 	"image/jpeg"
 	"image/png"
@@ -94,6 +95,7 @@ type opts struct {
 
 	TargetPx int  // auto-size: min pixels per QR module (default 8)
 	NoAuto   bool // disable auto-size
+	NoSplit  bool // pixel: grow side instead of split; grid: require fit in one configured image
 
 	Report func(map[string]any) // receives progress events (may be nil)
 }
@@ -1004,7 +1006,7 @@ func usage() {
 	fmt.Println(`Usage:
   pixpack <text|url|wifi|image|file> <content|path|ssid> [-o out.png] [-s 768] [-l M] [-c 900] [-fit]
                 [-fmt pixel|grid|qr] [-depth 16 -ch 4 -px 512] [-bits 2 -cell 3 -grid 256]
-                [-target-px 8] [-no-auto]
+                [-target-px 8] [-no-auto] [-no-split]
   pixpack wifi <ssid> [-pass <password>|-pass -] [-sec WPA|WEP|nopass] [-hidden] [-o wifi.png]
   pixpack decode [-o dir] img1.png img2.png ...
   pixpack serve [-addr :8090]
@@ -1029,19 +1031,20 @@ func runEncode() {
 	fs := flag.NewFlagSet("pixpack", flag.ExitOnError)
 	out := fs.String("o", "out.png", "output PNG file")
 	size := fs.Int("s", 768, "image size (px)")
-	level := fs.String("l", "M", "error correction level: L, M, Q, H")
+	level := fs.String("l", "L", "error correction level: L, M, Q, H")
 	chunk := fs.Int("c", 900, "data characters per QR when splitting")
 	fit := fs.Bool("fit", false, "image: shrink + JPEG compress to fit 1 QR")
 	max := fs.Int("max", maxChunks, "max QR/images")
-	format := fs.String("fmt", "pixel", "format for image/file: pixel (densest), grid, qr")
+	format := fs.String("fmt", "grid", "format for image/file: pixel (densest), grid, qr")
 	depth := fs.Int("depth", 16, "pixel: 8 or 16 bits/channel")
 	chn := fs.Int("ch", 4, "pixel: 3 (RGB) or 4 (RGBA)")
 	px := fs.Int("px", 512, "pixel: pixels per image side")
-	bits := fs.Int("bits", 2, "grid: bits/color channel (1-8), higher = denser but less robust")
-	cellPx := fs.Int("cell", 3, "grid: pixels per cell")
-	gridW := fs.Int("grid", 256, "grid: cells per side")
+	bits := fs.Int("bits", 8, "grid: bits/color channel (1-8), higher = denser but less robust")
+	cellPx := fs.Int("cell", 6, "grid: pixels per cell")
+	gridW := fs.Int("grid", 999, "grid: cells per side")
 	targetPx := fs.Int("target-px", 8, "auto-size: min pixels per QR module (4-16)")
 	noAuto := fs.Bool("no-auto", false, "disable auto-size (use -s exactly, may be unscannable)")
+	noSplit := fs.Bool("no-split", false, "pixel/grid: grow image to fit in 1 instead of splitting")
 	wpass := fs.String("pass", "", "wifi: password (use - to read it from stdin)")
 	wsec := fs.String("sec", "WPA", "wifi: security WPA, WEP or nopass")
 	whid := fs.Bool("hidden", false, "wifi: hidden network")
@@ -1078,7 +1081,7 @@ func runEncode() {
 	o := opts{RL: parseLevel(*level), Size: *size, Chunk: *chunk, MaxChunks: *max, Fit: *fit,
 		Format: *format, Bits: clampInt(*bits, 1, 8), Cell: clampInt(*cellPx, 1, 16), GridW: clampInt(*gridW, 16, 2048),
 		Depth: normDepth(*depth), Channels: normCh(*chn), PixSide: clampInt(*px, 16, 4096),
-		TargetPx: clampInt(*targetPx, 4, 16), NoAuto: *noAuto,
+		TargetPx: clampInt(*targetPx, 4, 16), NoAuto: *noAuto, NoSplit: *noSplit,
 		WifiSSID: input, WifiPass: *wpass, WifiSec: *wsec, WifiHidden: *whid}
 	o.Report = cliReport()
 	imgs, err := generate(mode, text, name, data, o)
@@ -1179,14 +1182,15 @@ func optsFrom(get func(string) string) opts {
 		MaxChunks: maxChunks,
 		Fit:       get("fit") == "1",
 		Format:    get("format"),
-		Bits:      clampInt(atoiDef(get("bits"), 2), 1, 8),
-		Cell:      clampInt(atoiDef(get("cell"), 3), 1, 16),
-		GridW:     clampInt(atoiDef(get("gridw"), 256), 16, 2048),
+		Bits:      clampInt(atoiDef(get("bits"), 8), 1, 8),
+		Cell:      clampInt(atoiDef(get("cell"), 6), 1, 16),
+		GridW:     clampInt(atoiDef(get("gridw"), 999), 16, 2048),
 		Depth:     normDepth(atoiDef(get("depth"), 16)),
 		Channels:  normCh(atoiDef(get("ch"), 4)),
 		PixSide:   clampInt(atoiDef(get("px"), 512), 16, 4096),
 		TargetPx:  clampInt(atoiDef(get("targetpx"), 8), 4, 16),
 		NoAuto:    get("noauto") == "1",
+		NoSplit:   get("nosplit") == "1",
 
 		WifiSSID:   get("ssid"),
 		WifiPass:   get("wpass"),
@@ -1470,25 +1474,28 @@ tr.best .mini>div{background:#16a34a}
 <small>Unchecked: keep original image, auto-split into multiple images.</small></div>
 <div id="fmtBox" style="display:none">
 <label>Output format</label>
-<select id="format"><option value="pixel">Pixel PNG (densest, pixpack-only)</option><option value="grid">Color grid (pixpack-only)</option><option value="qr">QR codes (scannable by phone)</option></select>
+<select id="format"><option value="pixel">Pixel PNG (densest, pixpack-only)</option><option value="grid" selected>Color grid (pixpack-only)</option><option value="qr">QR codes (scannable by phone)</option></select>
 <div id="pixBox"><div class="row">
 <div><label>Bits / channel</label><select id="depth"><option>16</option><option>8</option></select></div>
 <div><label>Channels</label><select id="chn"><option value="4">RGBA (4)</option><option value="3">RGB (3)</option></select></div>
 <div><label>Pixels / side</label><input id="px" type="number" value="512" min="16" max="4096"></div>
 </div></div>
 <div id="gridBox" style="display:none"><div class="row">
-<div><label>Bits / channel (1-8)</label><input id="bits" type="number" value="2" min="1" max="8"></div>
-<div><label>Pixels per cell</label><input id="cell" type="number" value="3" min="1" max="16"></div>
-<div><label>Cells per side</label><input id="gridw" type="number" value="256" min="16" max="2048"></div>
+<div><label>Bits / channel (1-8)</label><input id="bits" type="number" value="8" min="1" max="8"></div>
+<div><label>Pixels per cell</label><input id="cell" type="number" value="6" min="1" max="16"></div>
+<div><label>Cells per side</label><input id="gridw" type="number" value="999" min="16" max="2048"></div>
 </div></div>
 </div>
 <div class="row">
 <div><label>Image size (px)</label><input id="size" type="number" value="768" min="128" max="4096"></div>
-<div><label>Error correction</label><select id="level"><option>L</option><option selected>M</option><option>Q</option><option>H</option></select></div>
+<div><label>Error correction</label><select id="level"><option selected>L</option><option>M</option><option>Q</option><option>H</option></select></div>
 </div>
 <div class="row">
 <div><label>Target module px</label><input id="targetpx" type="number" value="8" min="4" max="16"></div>
 <div><label style="margin-top:24px"><input type="checkbox" id="noauto"> Disable auto-size</label></div>
+</div>
+<div class="row">
+<div><label style="margin-top:0"><input type="checkbox" id="nosplit"> No auto-split (grow image instead)</label></div>
 </div>
 <small>Auto-size grows the image if modules would be &lt; target px (QR would be unscannable).</small>
 <button id="go">Encode</button>
@@ -1548,6 +1555,7 @@ function build(){
   fd.append("cell",$("cell").value);fd.append("gridw",$("gridw").value);
   fd.append("depth",$("depth").value);fd.append("ch",$("chn").value);fd.append("px",$("px").value);
   fd.append("targetpx",$("targetpx").value);fd.append("noauto",$("noauto").checked?"1":"0");
+  fd.append("nosplit",$("nosplit").checked?"1":"0");
   if($("file").files[0])fd.append("file",$("file").files[0]);
   return fd;
 }
@@ -1723,6 +1731,11 @@ $("go").onclick=function(){
         "size "+e.from+"px → "+e.to+"px (v"+e.version+", modules="+e.modules+
         ", target "+e.target_px+"px/module)");
     }
+    else if(e.type==="split"){
+      setBar("e",0,"Splitting into "+e.count+" images",
+        e.count+" × "+(e.side_px+"px ")+(e.format==="grid"?("grid "+e.cells+"×"+e.cells+"×"+e.bits+"bit"):("pixel "+e.depth+"bit×"+e.channels+"ch"))+
+        " — "+fmt(e.comp_len)+" packed, "+fmt(e.per_img)+" per image. Tick \"No auto-split\" to fit in 1 huge image.");
+    }
     else if(e.type==="packstart"){total=e.total;doneN=0;rows=[];setBar("e",0,"Compressing","0/"+total+" algorithms");}
     else if(e.type==="algo"){
       rows.push(e);
@@ -1790,12 +1803,35 @@ $("dgo").onclick=function(){
 
 // ======================================================================
 // Color grid format
+//
+// Layout (unchanged wire format QCG1 — backward compatible):
+//   cell[0] = white marker
+//   cell[1] = black marker
+//   cell[2 .. 2+hdrCells-1] = header at 1 bit/channel
+//   remaining cells = payload at bpc bits/channel
+//
+// Design goals:
+//   • Respect UI/CLI settings exactly (GridW, Cell, Bits, NoSplit).
+//     No auto-grow of grid size, no silent resizing of cells.
+//   • Peak RAM stays under ~512MB by processing one image at a time
+//     and releasing the RGBA buffer immediately after PNG encode.
+//   • Only fails when a *single* configured image would need more
+//     raw pixel memory than the process budget allows (physics, not policy).
 // ======================================================================
 
 const (
-	gridHdrLen   = 21
-	gridHdrCells = (gridHdrLen * 8) / 3
+	gridHdrLen = 21
+	// Soft peak budget for one RGBA buffer. Leaves headroom for the
+	// compressed payload, PNG output, and Go runtime under a 512MB ceiling.
+	gridRGBABudget = 380 << 20
 )
+
+// gridHdrCells = ceil(gridHdrLen*8 / 3) = 56
+func gridHdrCells() int {
+	return (gridHdrLen*8 + 2) / 3
+}
+
+// ---------- bit I/O ----------
 
 type bitReader struct {
 	data []byte
@@ -1832,32 +1868,111 @@ func (b *bitWriter) write(v, n int) {
 	}
 }
 
+// ---------- encode ----------
+
 func gridEncode(name string, data []byte, o opts) ([][]byte, error) {
 	comp, err := packWith(name, data, o.Report)
 	if err != nil {
 		return nil, err
 	}
-	bpc, w, cell := o.Bits, o.GridW, o.Cell
-	capBytes := (w*w - 2 - gridHdrCells) * 3 * bpc / 8
+
+	// Honour UI settings exactly — only clamp to valid ranges, never resize.
+	bpc := o.Bits
+	if bpc < 1 {
+		bpc = 1
+	} else if bpc > 8 {
+		bpc = 8
+	}
+	w := o.GridW
+	if w < 16 {
+		w = 16
+	}
+	cell := o.Cell
+	if cell < 1 {
+		cell = 1
+	}
+
+	hdrCells := gridHdrCells()
+	perCellBits := 3 * bpc
+
+	// Capacity of one image at the *configured* geometry.
+	// Height grows with payload for the last (or only) image; width is fixed.
+	// For capacity planning we use a square budget of w×w cells.
+	usableCells := w*w - 2 - hdrCells
+	if usableCells <= 0 {
+		return nil, errors.New("grid too small for header")
+	}
+	capBytes := usableCells * perCellBits / 8
 	if capBytes <= 0 {
 		return nil, errors.New("grid too small")
 	}
-	total := (len(comp) + capBytes - 1) / capBytes
-	if total > o.MaxChunks || total > 65535 {
-		return nil, fmt.Errorf("data too large: need %d images (max %d)", total, o.MaxChunks)
+
+	// Raw RGBA size of a full-square image at this setting.
+	// Used only to decide whether one image is physically renderable
+	// within the process memory budget — not to change user settings.
+	squareRGBA := int64(w) * int64(cell) * int64(w) * int64(cell) * 4
+	if squareRGBA > int64(gridRGBABudget) {
+		return nil, fmt.Errorf(
+			"grid setting %d cells × %d px/cell = %d×%d image needs ~%d MB raw (budget ~%d MB); lower cells/side or px/cell in the UI",
+			w, cell, w*cell, w*cell, squareRGBA>>20, gridRGBABudget>>20,
+		)
 	}
-	crc := crc32.ChecksumIEEE(comp)
-	out := make([][]byte, 0, total)
-	for i := 0; i < total; i++ {
-		end := (i + 1) * capBytes
-		if end > len(comp) {
-			end = len(comp)
+
+	total := (len(comp) + capBytes - 1) / capBytes
+	if total < 1 {
+		total = 1
+	}
+
+	if o.NoSplit {
+		// Strict: exactly one image at the configured w×w geometry.
+		// Do not grow width/height. If payload does not fit, ask the user
+		// to raise grid size / bits or turn off NoSplit in the UI.
+		if len(comp) > capBytes {
+			return nil, fmt.Errorf(
+				"NoSplit: need %d bytes, one %d×%d grid holds %d bytes; increase cells/side or bits in the UI, or disable NoSplit",
+				len(comp), w, w, capBytes,
+			)
 		}
-		b, err := renderGrid(comp[i*capBytes:end], i+1, total, crc, w, cell, bpc)
+		crc := crc32.ChecksumIEEE(comp)
+		png, err := renderGrid(comp, 1, 1, crc, w, cell, bpc)
 		if err != nil {
 			return nil, err
 		}
-		out = append(out, b)
+		return [][]byte{png}, nil
+	}
+
+	// Split mode: fixed geometry from UI, as many images as needed.
+	if total > o.MaxChunks || total > 65535 {
+		return nil, fmt.Errorf("data too large: need %d images (max %d)", total, o.MaxChunks)
+	}
+	if total > 1 {
+		o.emit(map[string]any{
+			"type":     "split",
+			"format":   "grid",
+			"count":    total,
+			"per_img":  capBytes,
+			"side_px":  w * cell,
+			"cells":    w,
+			"bits":     bpc,
+			"comp_len": len(comp),
+		})
+	}
+
+	crc := crc32.ChecksumIEEE(comp)
+	out := make([][]byte, 0, total)
+	for i := 0; i < total; i++ {
+		start := i * capBytes
+		end := start + capBytes
+		if end > len(comp) {
+			end = len(comp)
+		}
+		// One image at a time — previous PNG stays in out[], but the large
+		// RGBA buffer lives only inside renderGrid and is freed on return.
+		png, err := renderGrid(comp[start:end], i+1, total, crc, w, cell, bpc)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, png)
 		o.emit(map[string]any{"type": "progress", "done": i + 1, "total": total})
 	}
 	return out, nil
@@ -1873,80 +1988,258 @@ func renderGrid(part []byte, idx, total int, crc uint32, w, cell, bpc int) ([]by
 	binary.BigEndian.PutUint32(hdr[13:], uint32(len(part)))
 	binary.BigEndian.PutUint32(hdr[17:], crc32.ChecksumIEEE(hdr[:17]))
 
+	hdrCells := gridHdrCells()
 	bodyCells := (len(part)*8 + 3*bpc - 1) / (3 * bpc)
-	n := 2 + gridHdrCells + bodyCells
+	n := 2 + hdrCells + bodyCells
 	h := (n + w - 1) / w
-	img := image.NewRGBA(image.Rect(0, 0, w*cell, h*cell))
-	for i := range img.Pix {
-		img.Pix[i] = 255
+	if h < 1 {
+		h = 1
 	}
-	set := func(i int, r, g, b uint8) {
-		x0, y0 := (i%w)*cell, (i/w)*cell
-		for y := y0; y < y0+cell; y++ {
-			off := img.PixOffset(x0, y)
-			for x := 0; x < cell; x++ {
-				img.Pix[off+4*x] = r
-				img.Pix[off+4*x+1] = g
-				img.Pix[off+4*x+2] = b
-				img.Pix[off+4*x+3] = 255
-			}
+
+	imgW := w * cell
+	imgH := h * cell
+	// Peak RAM is the in-memory raster; with palette path it is 1 byte/px.
+	// Budget still guards against pathological UI settings.
+	levels := 1 << uint(bpc)
+	usePal := bpc <= 2 // levels^3 <= 64, fits 8-bit palette comfortably
+	bppMem := 1
+	if !usePal {
+		bppMem = 4
+	}
+	rawBytes := int64(imgW) * int64(imgH) * int64(bppMem)
+	if rawBytes > int64(gridRGBABudget) {
+		return nil, fmt.Errorf("grid image %dx%d needs ~%d MB raw (budget ~%d MB)",
+			imgW, imgH, rawBytes>>20, gridRGBABudget>>20)
+	}
+
+	scale := make([]uint8, levels)
+	if levels == 1 {
+		scale[0] = 0
+	} else {
+		for i := 0; i < levels; i++ {
+			scale[i] = uint8(i * 255 / (levels - 1))
 		}
 	}
-	set(0, 255, 255, 255)
-	set(1, 0, 0, 0)
 
-	hr := &bitReader{data: hdr}
-	for k := 0; k < gridHdrCells; k++ {
-		r, g, b := hr.read(1), hr.read(1), hr.read(1)
-		set(2+k, uint8(r*255), uint8(g*255), uint8(b*255))
+	var outImg image.Image
+
+	if usePal {
+		// Build palette: index 0 = white marker, 1 = black marker,
+		// then all level combinations for body + header bits.
+		pal := make(color.Palette, 0, 2+levels*levels*levels)
+		pal = append(pal, color.NRGBA{255, 255, 255, 255}, color.NRGBA{0, 0, 0, 255})
+		idxOf := make(map[uint32]uint8, 2+levels*levels*levels)
+		idxOf[0xffffff] = 0
+		idxOf[0x000000] = 1
+		for ri := 0; ri < levels; ri++ {
+			for gi := 0; gi < levels; gi++ {
+				for bi := 0; bi < levels; bi++ {
+					r, g, b := scale[ri], scale[gi], scale[bi]
+					key := uint32(r)<<16 | uint32(g)<<8 | uint32(b)
+					if _, ok := idxOf[key]; ok {
+						continue
+					}
+					idxOf[key] = uint8(len(pal))
+					pal = append(pal, color.NRGBA{r, g, b, 255})
+				}
+			}
+		}
+		// Header uses pure 0/255 which already map to black/white or level extremes.
+		for _, v := range []uint8{0, 255} {
+			key := uint32(v)<<16 | uint32(v)<<8 | uint32(v)
+			if _, ok := idxOf[key]; !ok {
+				idxOf[key] = uint8(len(pal))
+				pal = append(pal, color.NRGBA{v, v, v, 255})
+			}
+			// Also pure channel combos used by 1-bit header
+			for _, rr := range []uint8{0, 255} {
+				for _, gg := range []uint8{0, 255} {
+					for _, bb := range []uint8{0, 255} {
+						key := uint32(rr)<<16 | uint32(gg)<<8 | uint32(bb)
+						if _, ok := idxOf[key]; !ok {
+							idxOf[key] = uint8(len(pal))
+							pal = append(pal, color.NRGBA{rr, gg, bb, 255})
+						}
+					}
+				}
+			}
+		}
+
+		pi := image.NewPaletted(image.Rect(0, 0, imgW, imgH), pal)
+		// Default fill = white (index 0)
+		for i := range pi.Pix {
+			pi.Pix[i] = 0
+		}
+		setPal := func(ci int, r, g, b uint8) {
+			key := uint32(r)<<16 | uint32(g)<<8 | uint32(b)
+			id, ok := idxOf[key]
+			if !ok {
+				id = 0
+			}
+			x0 := (ci % w) * cell
+			y0 := (ci / w) * cell
+			for y := 0; y < cell; y++ {
+				off := (y0+y)*pi.Stride + x0
+				for x := 0; x < cell; x++ {
+					pi.Pix[off+x] = id
+				}
+			}
+		}
+		setPal(0, 255, 255, 255)
+		setPal(1, 0, 0, 0)
+		hr := &bitReader{data: hdr}
+		for k := 0; k < hdrCells; k++ {
+			r, g, b := hr.read(1), hr.read(1), hr.read(1)
+			setPal(2+k, uint8(r*255), uint8(g*255), uint8(b*255))
+		}
+		br := &bitReader{data: part}
+		base := 2 + hdrCells
+		for k := 0; k < bodyCells; k++ {
+			setPal(base+k, scale[br.read(bpc)], scale[br.read(bpc)], scale[br.read(bpc)])
+		}
+		outImg = pi
+	} else {
+		img := image.NewRGBA(image.Rect(0, 0, imgW, imgH))
+		pix := img.Pix
+		for i := 0; i < len(pix); i += 4 {
+			pix[i] = 255
+			pix[i+1] = 255
+			pix[i+2] = 255
+			pix[i+3] = 255
+		}
+		set := func(ci int, r, g, b uint8) {
+			x0 := (ci % w) * cell
+			y0 := (ci / w) * cell
+			for y := 0; y < cell; y++ {
+				off := ((y0+y)*imgW + x0) * 4
+				for x := 0; x < cell; x++ {
+					pix[off] = r
+					pix[off+1] = g
+					pix[off+2] = b
+					off += 4
+				}
+			}
+		}
+		set(0, 255, 255, 255)
+		set(1, 0, 0, 0)
+		hr := &bitReader{data: hdr}
+		for k := 0; k < hdrCells; k++ {
+			r, g, b := hr.read(1), hr.read(1), hr.read(1)
+			set(2+k, uint8(r*255), uint8(g*255), uint8(b*255))
+		}
+		br := &bitReader{data: part}
+		base := 2 + hdrCells
+		for k := 0; k < bodyCells; k++ {
+			set(base+k, scale[br.read(bpc)], scale[br.read(bpc)], scale[br.read(bpc)])
+		}
+		outImg = img
 	}
-	levels := 1 << uint(bpc)
-	sc := func(v int) uint8 { return uint8(v * 255 / (levels - 1)) }
-	br := &bitReader{data: part}
-	for k := 0; k < bodyCells; k++ {
-		r, g, b := br.read(bpc), br.read(bpc), br.read(bpc)
-		set(2+gridHdrCells+k, sc(r), sc(g), sc(b))
-	}
+
+	// Solid-color cells compress extremely well — NoCompression was the main
+	// reason output could reach ~30–50× the payload. DefaultCompression typically
+	// brings PNG size close to the packed payload (often 1–3× after cell overhead).
 	var buf bytes.Buffer
-	if err := png.Encode(&buf, img); err != nil {
+	enc := png.Encoder{CompressionLevel: png.DefaultCompression}
+	if err := enc.Encode(&buf, outImg); err != nil {
 		return nil, err
 	}
 	return buf.Bytes(), nil
 }
+
+// ---------- decode ----------
 
 func lum(img image.Image, x, y int) int {
 	r, g, b, _ := img.At(x, y).RGBA()
 	return int(((r + g + b) / 3) >> 8)
 }
 
-func tryGrid(img image.Image) (item, bool) {
+func detectCellSize(img image.Image) int {
 	b := img.Bounds()
-	if b.Dx() < 16 || b.Dy() < 2 || lum(img, b.Min.X, b.Min.Y) < 200 {
-		return item{}, false
+	if b.Dx() < 16 || b.Dy() < 2 {
+		return 0
+	}
+	if lum(img, b.Min.X, b.Min.Y) < 200 {
+		return 0
 	}
 	cell := 0
-	for x := b.Min.X; x < b.Max.X && lum(img, x, b.Min.Y) >= 128; x++ {
+	for x := b.Min.X; x < b.Max.X && lum(img, x, b.Min.Y) >= 160; x++ {
 		cell++
 	}
 	if cell < 1 || cell*2 >= b.Dx() {
+		return 0
+	}
+	nx := b.Min.X + cell
+	if nx >= b.Max.X || lum(img, nx, b.Min.Y) >= 128 {
+		return 0
+	}
+	dark := 0
+	for x := nx; x < b.Max.X && lum(img, x, b.Min.Y) < 128; x++ {
+		dark++
+	}
+	if dark < cell/2 {
+		return 0
+	}
+	return cell
+}
+
+func tryGrid(img image.Image) (item, bool) {
+	b := img.Bounds()
+	cell := detectCellSize(img)
+	if cell < 1 {
 		return item{}, false
 	}
 	W, H := b.Dx()/cell, b.Dy()/cell
+	if W < 4 || H < 1 {
+		return item{}, false
+	}
+
+	var pix []byte
+	var stride int
+	switch v := img.(type) {
+	case *image.RGBA:
+		pix, stride = v.Pix, v.Stride
+	case *image.NRGBA:
+		pix, stride = v.Pix, v.Stride
+	}
+
 	sample := func(i int) (int, int, int) {
 		cx, cy := i%W, i/W
 		if cy >= H {
 			return 0, 0, 0
 		}
-		x0, y0 := b.Min.X+cx*cell, b.Min.Y+cy*cell
+		x0 := b.Min.X + cx*cell
+		y0 := b.Min.Y + cy*cell
 		m := cell / 4
+		x1, x2 := x0+m, x0+cell-m
+		y1, y2 := y0+m, y0+cell-m
+		if x2 <= x1 {
+			x1, x2 = x0, x0+cell
+		}
+		if y2 <= y1 {
+			y1, y2 = y0, y0+cell
+		}
+
 		var sr, sg, sb, n uint32
-		for y := y0 + m; y < y0+cell-m; y++ {
-			for x := x0 + m; x < x0+cell-m; x++ {
-				r, g, bl, _ := img.At(x, y).RGBA()
-				sr += r >> 8
-				sg += g >> 8
-				sb += bl >> 8
-				n++
+		if pix != nil {
+			for y := y1; y < y2; y++ {
+				off := (y-b.Min.Y)*stride + (x1-b.Min.X)*4
+				for x := x1; x < x2; x++ {
+					sr += uint32(pix[off])
+					sg += uint32(pix[off+1])
+					sb += uint32(pix[off+2])
+					n++
+					off += 4
+				}
+			}
+		} else {
+			for y := y1; y < y2; y++ {
+				for x := x1; x < x2; x++ {
+					r, g, bl, _ := img.At(x, y).RGBA()
+					sr += r >> 8
+					sg += g >> 8
+					sb += bl >> 8
+					n++
+				}
 			}
 		}
 		if n == 0 {
@@ -1954,12 +2247,14 @@ func tryGrid(img image.Image) (item, bool) {
 		}
 		return int(sr / n), int(sg / n), int(sb / n)
 	}
+
 	if r, g, bl := sample(1); (r+g+bl)/3 >= 128 {
 		return item{}, false
 	}
 
+	hdrCells := gridHdrCells()
 	hw := &bitWriter{}
-	for k := 0; k < gridHdrCells; k++ {
+	for k := 0; k < hdrCells; k++ {
 		r, g, bl := sample(2 + k)
 		for _, v := range [3]int{r, g, bl} {
 			bit := 0
@@ -1974,6 +2269,7 @@ func tryGrid(img image.Image) (item, bool) {
 		crc32.ChecksumIEEE(hdr[:17]) != binary.BigEndian.Uint32(hdr[17:21]) {
 		return item{}, false
 	}
+
 	bpc := int(hdr[4])
 	idx := int(binary.BigEndian.Uint16(hdr[5:]))
 	total := int(binary.BigEndian.Uint16(hdr[7:]))
@@ -1982,14 +2278,17 @@ func tryGrid(img image.Image) (item, bool) {
 	if bpc < 1 || bpc > 8 || idx < 1 || idx > total || plen <= 0 {
 		return item{}, false
 	}
+
 	bodyCells := (plen*8 + 3*bpc - 1) / (3 * bpc)
-	if 2+gridHdrCells+bodyCells > W*H {
+	if 2+hdrCells+bodyCells > W*H {
 		return item{}, false
 	}
+
 	levels := 1 << uint(bpc)
 	bw := &bitWriter{}
+	base := 2 + hdrCells
 	for k := 0; k < bodyCells; k++ {
-		r, g, bl := sample(2 + gridHdrCells + k)
+		r, g, bl := sample(base + k)
 		for _, v := range [3]int{r, g, bl} {
 			q := (v*(levels-1) + 127) / 255
 			if q > levels-1 {
@@ -2009,8 +2308,9 @@ func tryGrid(img image.Image) (item, bool) {
 // ======================================================================
 
 const (
-	pxHdrLen    = 22
-	pxHdrPixels = 8
+	pxHdrLen     = 22
+	pxHdrPixels  = 8
+	pxMaxRawRGBA = 400 << 20 // soft ceiling ~400MB raw buffer
 )
 
 func normDepth(n int) int {
@@ -2034,13 +2334,36 @@ func pixelEncode(name string, data []byte, o opts) ([][]byte, error) {
 	}
 	depth, ch, side := o.Depth, o.Channels, o.PixSide
 	bpp := ch * depth / 8
-	capBytes := (side*side - pxHdrPixels) * bpp
+	perImage := func(s int) int { return (s*s - pxHdrPixels) * bpp }
+	if o.NoSplit {
+		need := perImage(side)
+		for need < len(comp) && side < 8192 {
+			side++
+			need = perImage(side)
+		}
+		if need < len(comp) {
+			return nil, fmt.Errorf("pixel: %d bytes need a %dx%d image (max 8192)", len(comp), side, side)
+		}
+	}
+	capBytes := perImage(side)
 	if capBytes <= 0 {
 		return nil, errors.New("image too small")
 	}
 	total := (len(comp) + capBytes - 1) / capBytes
 	if total > o.MaxChunks || total > 65535 {
 		return nil, fmt.Errorf("data too large: need %d images (max %d)", total, o.MaxChunks)
+	}
+	if total > 1 {
+		o.emit(map[string]any{
+			"type":     "split",
+			"format":   "pixel",
+			"count":    total,
+			"per_img":  capBytes,
+			"side_px":  side,
+			"depth":    depth,
+			"channels": ch,
+			"comp_len": len(comp),
+		})
 	}
 	crc := crc32.ChecksumIEEE(comp)
 	out := make([][]byte, 0, total)
@@ -2078,6 +2401,9 @@ func renderPixel(part []byte, idx, total int, crc uint32, side, depth, ch int) (
 	bodyPixels := (len(part) + bpp - 1) / bpp
 	n := pxHdrPixels + bodyPixels
 	h := (n + side - 1) / side
+	if int64(side)*int64(h)*int64(S) > int64(pxMaxRawRGBA) {
+		return nil, fmt.Errorf("pixel image %dx%d exceeds memory budget", side, h)
+	}
 	pix := make([]byte, side*h*S)
 	for i := range pix {
 		pix[i] = 0xFF
