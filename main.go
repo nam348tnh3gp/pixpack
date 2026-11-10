@@ -1225,6 +1225,28 @@ func serve(addr string) {
 		io.WriteString(w, indexHTML)
 	})
 
+	// Discord domain verification: GET /.well-known/discord
+	// Content is read from wellknown/discord/verify.txt (next to the working directory).
+	mux.HandleFunc("/.well-known/discord", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet && r.Method != http.MethodHead {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		p := filepath.Join("wellknown", "discord", "verify.txt")
+		b, err := os.ReadFile(p)
+		if err != nil {
+			http.Error(w, "discord verification file not found", http.StatusNotFound)
+			return
+		}
+		// Discord expects plain text, no charset quirks, no extra headers that break checks.
+		w.Header().Set("Content-Type", "text/plain")
+		w.Header().Set("Cache-Control", "no-store")
+		w.WriteHeader(http.StatusOK)
+		if r.Method != http.MethodHead {
+			w.Write(b)
+		}
+	})
+
 	mux.HandleFunc("/qr", func(w http.ResponseWriter, r *http.Request) {
 		q := r.URL.Query()
 		mode := q.Get("mode")
